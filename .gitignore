@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Build output
+build/
+cmake-build-*/
+out/
+
+# ImGui window layout (per-user runtime state)
+imgui.ini
+
+# IDE
+.vscode/
+.idea/
