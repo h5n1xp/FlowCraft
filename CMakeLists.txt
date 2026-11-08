@@ -40,6 +40,7 @@ set(FC_SOURCES
     ${FC_DIR}/LbmReference.cpp
     ${FC_DIR}/LbmSolver.cpp
     ${FC_DIR}/OverlayRenderer.cpp
+    ${FC_DIR}/PanelSolver.cpp
     ${FC_DIR}/PotentialFlowSolver.cpp
     ${FC_DIR}/Renderer.cpp
     ${FC_DIR}/STLLoader.cpp
@@ -82,6 +83,6 @@ endif()
 
 # The GPU-vs-CPU solver consistency test (headless): `cmake --build build --target gpu_vs_cpu_test`
 add_executable(gpu_vs_cpu_test EXCLUDE_FROM_ALL
-    tests/gpu_vs_cpu_test.cpp ${FC_DIR}/LbmSolver.cpp ${FC_DIR}/LbmReference.cpp)
+    tests/gpu_vs_cpu_test.cpp ${FC_DIR}/LbmSolver.cpp ${FC_DIR}/LbmReference.cpp ${FC_DIR}/PanelSolver.cpp)
 target_include_directories(gpu_vs_cpu_test PRIVATE ${FC_DIR})
 target_link_libraries(gpu_vs_cpu_test PRIVATE SDL3::SDL3)

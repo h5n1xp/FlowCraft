@@ -36,6 +36,7 @@
 #include "LbmReference.h"
 #include "LbmSolver.h"
 #include "OverlayRenderer.h"
+#include "PanelSolver.h"
 #include "PotentialFlowSolver.h"
 #include "Renderer.h"
 #include "SessionFile.h"
@@ -142,7 +143,48 @@ enum class TaskKind { None, Voxelizing, InitializingSolver, BuildingOverlay };
 // memory per cell, reaching resolutions neither of the other two can.
 // Switching backends is handled exactly like switching lattice model:
 // invalidates the current solver, needs re-Init.
-enum class SolverBackend { GPU, CPU, Naive };
+enum class SolverBackend { GPU = 0, CPU = 1, Naive = 2, PanelGPU = 3, PanelCPU = 4 };
+
+inline bool IsLbmBackend(SolverBackend b) {
+    return b == SolverBackend::GPU || b == SolverBackend::CPU;
+}
+inline bool IsPanelBackend(SolverBackend b) {
+    return b == SolverBackend::PanelGPU || b == SolverBackend::PanelCPU;
+}
+inline bool IsGpuBackend(SolverBackend b) {
+    return b == SolverBackend::GPU || b == SolverBackend::PanelGPU;
+}
+
+// Helper for UI: maps SolverBackend <-> (solverTypeIndex, deviceIndex) where
+// solverTypeIndex: 0 = LBM, 1 = Panel Method, 2 = Potential Flow
+// deviceIndex:     0 = GPU, 1 = CPU
+inline void SplitSolverBackend(SolverBackend b, int& outTypeIndex, int& outDeviceIndex) {
+    if (b == SolverBackend::GPU) {
+        outTypeIndex = 0;
+        outDeviceIndex = 0;
+    } else if (b == SolverBackend::CPU) {
+        outTypeIndex = 0;
+        outDeviceIndex = 1;
+    } else if (b == SolverBackend::PanelGPU) {
+        outTypeIndex = 1;
+        outDeviceIndex = 0;
+    } else if (b == SolverBackend::PanelCPU) {
+        outTypeIndex = 1;
+        outDeviceIndex = 1;
+    } else {
+        outTypeIndex = 2;
+        outDeviceIndex = 1;
+    }
+}
+
+inline SolverBackend CombineSolverBackend(int typeIndex, int deviceIndex) {
+    if (typeIndex == 0) {
+        return deviceIndex == 0 ? SolverBackend::GPU : SolverBackend::CPU;
+    } else if (typeIndex == 1) {
+        return deviceIndex == 0 ? SolverBackend::PanelGPU : SolverBackend::PanelCPU;
+    }
+    return SolverBackend::Naive;
+}
 
 // Three different ways to look at the same field: a single colored
 // cross-section (the original), the whole volume as semi-transparent
@@ -294,8 +336,9 @@ struct AppState {
     // the main loop, right after DrawUI).
     std::mutex lbmMutex;
     LbmSolver lbmSolver;
-    LbmReference lbmReference;        // CPU backend — see SolverBackend's comment
+    LbmReference lbmReference;        // CPU LBM backend — see SolverBackend's comment
     PotentialFlowSolver potentialFlow;  // Naive backend — see SolverBackend's comment
+    PanelSolver panelSolver;          // 3D Lifting Panel Method backend (GPU + CPU)
     SolverBackend lbmBackend = SolverBackend::GPU;
     std::atomic<bool> lbmValid{false};
     std::atomic<bool> lbmRunning{false};
@@ -1238,7 +1281,7 @@ std::vector<float> SampleCoarseFieldOntoFineGrid(const VoxelGrid& fineGrid, cons
 // can cleanly fall back to the normal uniform Reset() rather than being
 // left with an unseeded solver.
 bool ApplyWarmStart(AppState& app) {
-    if (app.lbmBackend == SolverBackend::Naive) return false;
+    if (!IsLbmBackend(app.lbmBackend)) return false;
 
     Mat4 model = ModelMatrix(app);
     std::vector<Vec3> worldVerts(app.mesh.vertices.size());
@@ -1338,7 +1381,7 @@ void SyncLbmStatsAtomics(AppState& app) {
 // even see — see kLatticeVelocityScale) mid-run doesn't need it.
 void InitLbmSolver(AppState& app) {
     if (!app.voxelGridValid) return;
-    if (app.lbmBackend == SolverBackend::GPU && !app.gpuDevice) return;
+    if (IsGpuBackend(app.lbmBackend) && !app.gpuDevice) return;
     app.lbmParams.inletVelocity = kLatticeVelocityScale;
     app.lbmRunning = false;
     // Locked so this can't reallocate buffers out from under the worker
@@ -1383,6 +1426,21 @@ void InitLbmSolver(AppState& app) {
         } catch (const std::exception& e) {
             app.lbmValid = false;
             app.lbmInitError = std::string("CPU solver failed to allocate: ") + e.what();
+        }
+    } else if (IsPanelBackend(app.lbmBackend)) {
+        try {
+            bool useGpu = (app.lbmBackend == SolverBackend::PanelGPU);
+            PanelSolver::Params panelParams{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow};
+            app.lbmValid = app.panelSolver.Init(app.gpuDevice, useGpu, app.voxelGrid, panelParams);
+            if (app.lbmValid) {
+                app.lbmInitError.clear();
+            } else {
+                app.lbmInitError = app.panelSolver.LastError();
+                if (app.lbmInitError.empty()) app.lbmInitError = "Panel solver initialization failed.";
+            }
+        } catch (const std::exception& e) {
+            app.lbmValid = false;
+            app.lbmInitError = std::string("Panel solver failed to allocate: ") + e.what();
         }
     } else {
         // PotentialFlowSolver::Init() only allocates one scalar field (plus
@@ -1924,6 +1982,8 @@ void StartBuildOverlayTask(AppState& app) {
             std::lock_guard<std::mutex> lock(app.lbmMutex);
             if (app.lbmBackend == SolverBackend::CPU) {
                 field = app.lbmReference.ReadbackField();
+            } else if (IsPanelBackend(app.lbmBackend)) {
+                field = app.panelSolver.ReadbackField();
             } else {
                 field = app.potentialFlow.ReadbackField();
             }
@@ -1965,6 +2025,12 @@ void StepPotentialFlowLocked(AppState& app, int sweeps) {
     std::lock_guard<std::mutex> lock(app.lbmMutex);
     app.lbmStepProgress.store(0.0f, std::memory_order_relaxed);
     app.potentialFlow.Step(sweeps, &app.lbmStepProgress);
+}
+
+void StepPanelLocked(AppState& app, int sweeps) {
+    std::lock_guard<std::mutex> lock(app.lbmMutex);
+    app.lbmStepProgress.store(0.0f, std::memory_order_relaxed);
+    app.panelSolver.Step(sweeps, &app.lbmStepProgress);
 }
 
 // Same as StepSolverLocked, but submits one Z-chunk of one substep at a
@@ -2193,6 +2259,8 @@ void StartOverlayAutoUpdate(AppState& app, SolverBackend backend) {
             std::lock_guard<std::mutex> lock(app.lbmMutex);
             if (backend == SolverBackend::CPU) {
                 field = app.lbmReference.ReadbackField();
+            } else if (IsPanelBackend(backend)) {
+                field = app.panelSolver.ReadbackField();
             } else {
                 field = app.potentialFlow.ReadbackField();
             }
@@ -2225,6 +2293,8 @@ void LbmWorkerThreadFunc(AppState* appPtr) {
                 StepSolverPaced(app, substeps);
             } else if (backend == SolverBackend::CPU) {
                 StepReferenceLocked(app, substeps);
+            } else if (IsPanelBackend(backend)) {
+                StepPanelLocked(app, substeps);
             } else {
                 StepPotentialFlowLocked(app, substeps);
             }
@@ -3549,6 +3619,16 @@ void TriggerRefreshStats(AppState& app) {
         app.lbmLastStats.hasNaN = refStats.hasNaN;
         app.lbmLastStats.valid = true;
         field = app.lbmReference.ReadbackField();
+    } else if (IsPanelBackend(app.lbmBackend)) {
+        field = app.panelSolver.ReadbackField();
+        PanelSolver::Stats pStats = app.panelSolver.ComputeStats();
+        app.lbmLastStats.avgDensity = pStats.avgDensity;
+        app.lbmLastStats.minDensity = pStats.minDensity;
+        app.lbmLastStats.maxDensity = pStats.maxDensity;
+        app.lbmLastStats.avgSpeed = pStats.avgSpeed;
+        app.lbmLastStats.maxSpeed = pStats.maxSpeed;
+        app.lbmLastStats.hasNaN = pStats.hasNaN;
+        app.lbmLastStats.valid = pStats.valid;
     } else {
         PotentialFlowSolver::Stats naiveStats = app.potentialFlow.ComputeStats();
         app.lbmLastStats.avgDensity = naiveStats.avgDensity;
@@ -3792,6 +3872,8 @@ void DrawFusionRibbon(AppState& app, bool busy) {
                 StepSolverLocked(app, app.lbmSubstepsPerFrame);
             } else if (app.lbmBackend == SolverBackend::CPU) {
                 StepReferenceLocked(app, app.lbmSubstepsPerFrame);
+            } else if (IsPanelBackend(app.lbmBackend)) {
+                StepPanelLocked(app, app.lbmSubstepsPerFrame);
             } else {
                 StepPotentialFlowLocked(app, app.lbmSubstepsPerFrame);
             }
@@ -3904,9 +3986,11 @@ void DrawTelemetryHud(AppState& app, float topInset) {
 
         if (app.lbmValid) {
             ImGui::Separator();
-            bool isNaive = app.lbmBackend == SolverBackend::Naive;
-            if (isNaive) {
-                ImGui::Text("Solver: Potential Flow   Sweeps: %d", app.lbmStepCount.load());
+            if (app.lbmBackend == SolverBackend::Naive) {
+                ImGui::Text("Solver: Potential Flow (CPU)   Sweeps: %d", app.lbmStepCount.load());
+            } else if (IsPanelBackend(app.lbmBackend)) {
+                ImGui::Text("Solver: 3D Panel + Wake (%s)   Sweeps: %d",
+                            app.lbmBackend == SolverBackend::PanelGPU ? "GPU" : "CPU", app.lbmStepCount.load());
             } else {
                 ImGui::Text("Solver: %s (%s)   Steps: %d", LatticeModelName(app.lbmModel),
                             app.lbmBackend == SolverBackend::GPU ? "GPU" : "CPU", app.lbmStepCount.load());
@@ -4154,8 +4238,38 @@ void DrawFusionInspector(AppState& app, bool busy) {
                 }
                 ImGui::EndDisabled();
             } else {
+                bool isLbm = IsLbmBackend(app.lbmBackend);
+                bool isPanel = IsPanelBackend(app.lbmBackend);
                 bool isNaive = app.lbmBackend == SolverBackend::Naive;
-                if (!isNaive) {
+
+                ImGui::BeginDisabled(busy);
+                int solverTypeIdx = 0, deviceIdx = 0;
+                SplitSolverBackend(app.lbmBackend, solverTypeIdx, deviceIdx);
+                const char* solverTypeNames[] = {"LBM (Navier-Stokes)", "Panel Method (3D Lifting)", "Potential Flow (Naive)"};
+                ImGui::SetNextItemWidth(195);
+                if (ImGui::Combo("Solver Type", &solverTypeIdx, solverTypeNames, 3)) {
+                    app.lbmBackend = CombineSolverBackend(solverTypeIdx, deviceIdx);
+                    app.lbmValid = false;
+                    app.lbmRunning = false;
+                }
+                if (solverTypeIdx != 2) {
+                    const char* deviceNames[] = {"GPU (Compute Shader)", "CPU (Multithreaded)"};
+                    ImGui::SetNextItemWidth(195);
+                    if (ImGui::Combo("Device", &deviceIdx, deviceNames, 2)) {
+                        app.lbmBackend = CombineSolverBackend(solverTypeIdx, deviceIdx);
+                        app.lbmValid = false;
+                        app.lbmRunning = false;
+                    }
+                } else {
+                    ImGui::TextDisabled("Device: CPU (multithreaded red-black SOR)");
+                }
+                ImGui::EndDisabled();
+
+                if (isPanel) {
+                    ImGui::TextDisabled("3D Source Panels + Trailing-Edge Kutta Horseshoe Wake");
+                }
+
+                if (isLbm) {
                     ImGui::BeginDisabled(busy);
                     int modelIndex = app.lbmModel == LatticeModel::D3Q19 ? 0 : 1;
                     const char* modelNames[] = {"D3Q19 (accurate)", "D3Q15 (fast)"};
@@ -4167,17 +4281,6 @@ void DrawFusionInspector(AppState& app, bool busy) {
                     }
                     ImGui::EndDisabled();
                 }
-
-                ImGui::BeginDisabled(busy);
-                int backendIndex = static_cast<int>(app.lbmBackend);
-                const char* backendNames[] = {"GPU (LBM)", "CPU (LBM, multithreaded)", "Naive (potential flow)"};
-                ImGui::SetNextItemWidth(200);
-                if (ImGui::Combo("Backend", &backendIndex, backendNames, 3)) {
-                    app.lbmBackend = static_cast<SolverBackend>(backendIndex);
-                    app.lbmValid = false;
-                    app.lbmRunning = false;
-                }
-                ImGui::EndDisabled();
 
                 bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
                 int flowDirIndex = reverseFlow ? 1 : 0;
@@ -4194,6 +4297,9 @@ void DrawFusionInspector(AppState& app, bool busy) {
                             app.lbmReference.SetParams(LbmReference::Params{
                                 app.lbmParams.tau, app.lbmParams.inletVelocity, app.lbmParams.reverseFlow,
                                 app.lbmParams.freeSlipY, app.lbmParams.freeSlipZ, app.lbmParams.smagorinskyCs});
+                        } else if (IsPanelBackend(app.lbmBackend)) {
+                            app.panelSolver.SetParams(
+                                PanelSolver::Params{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow});
                         } else {
                             app.potentialFlow.SetParams(
                                 PotentialFlowSolver::Params{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow});
@@ -4204,7 +4310,7 @@ void DrawFusionInspector(AppState& app, bool busy) {
                 ImGui::SetNextItemWidth(140);
                 ImGui::DragFloat("Inlet velocity (mm/s)", &app.lbmInletVelocityMmPerS, 50.0f, 1.0f, 200000.0f, "%.0f");
 
-                if (!isNaive) {
+                if (isLbm) {
                     float tau = app.lbmTauAtomic.load(std::memory_order_relaxed);
                     ImGui::SetNextItemWidth(140);
                     if (ImGui::SliderFloat("Tau", &tau, kMinTau, 2.0f, "%.5f")) {
@@ -4255,10 +4361,10 @@ void DrawFusionInspector(AppState& app, bool busy) {
                 }
 
                 ImGui::SetNextItemWidth(140);
-                ImGui::SliderInt(isNaive ? "Sweeps/tick" : "Substeps/tick", &app.lbmSubstepsPerFrame, 1,
+                ImGui::SliderInt(!isLbm ? "Sweeps/tick" : "Substeps/tick", &app.lbmSubstepsPerFrame, 1,
                                   isNaive ? 500 : 20);
 
-                if (!isNaive) {
+                if (isLbm) {
                     ImGui::Separator();
                     ImGui::Checkbox("Start flow at mid-speed/pressure", &app.lbmSeedMidSpeed);
                     ImGui::Checkbox("Warm start from coarse grid", &app.warmStartEnabled);
@@ -4306,6 +4412,8 @@ void DrawFusionInspector(AppState& app, bool busy) {
                             StepSolverLocked(app, app.lbmSubstepsPerFrame);
                         } else if (app.lbmBackend == SolverBackend::CPU) {
                             StepReferenceLocked(app, app.lbmSubstepsPerFrame);
+                        } else if (IsPanelBackend(app.lbmBackend)) {
+                            StepPanelLocked(app, app.lbmSubstepsPerFrame);
                         } else {
                             StepPotentialFlowLocked(app, app.lbmSubstepsPerFrame);
                         }
@@ -4874,12 +4982,34 @@ void DrawUI(AppState& app) {
             ImGui::Separator();
             ImGui::TextUnformatted("Solver");
 
+            bool isLbm = IsLbmBackend(app.lbmBackend);
+            bool isPanel = IsPanelBackend(app.lbmBackend);
             bool isNaive = app.lbmBackend == SolverBackend::Naive;
-            if (!isNaive) {
-                // Naive (potential flow) isn't an LBM lattice at all — see
-                // PotentialFlowSolver's header comment — so this choice
-                // doesn't apply to it; app.lbmModel is simply left as
-                // whatever it already was for if the user switches back.
+
+            ImGui::BeginDisabled(busy);
+            int solverTypeIdx = 0, deviceIdx = 0;
+            SplitSolverBackend(app.lbmBackend, solverTypeIdx, deviceIdx);
+            const char* solverTypeNames[] = {"LBM (Navier-Stokes)", "Panel Method (3D Lifting)", "Potential Flow (Naive)"};
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::Combo("Solver Type", &solverTypeIdx, solverTypeNames, 3)) {
+                app.lbmBackend = CombineSolverBackend(solverTypeIdx, deviceIdx);
+                app.lbmValid = false;
+                app.lbmRunning = false;
+            }
+            if (solverTypeIdx != 2) {
+                const char* deviceNames[] = {"GPU (Compute Shader)", "CPU (Multithreaded)"};
+                ImGui::SetNextItemWidth(220);
+                if (ImGui::Combo("Device", &deviceIdx, deviceNames, 2)) {
+                    app.lbmBackend = CombineSolverBackend(solverTypeIdx, deviceIdx);
+                    app.lbmValid = false;
+                    app.lbmRunning = false;
+                }
+            } else {
+                ImGui::TextDisabled("Device: CPU (multithreaded red-black SOR)");
+            }
+            ImGui::EndDisabled();
+
+            if (isLbm) {
                 ImGui::BeginDisabled(busy);
                 int modelIndex = app.lbmModel == LatticeModel::D3Q19 ? 0 : 1;
                 const char* modelNames[] = {"D3Q19 (accurate)", "D3Q15 (fast)"};
@@ -4899,33 +5029,12 @@ void DrawUI(AppState& app) {
                 }
             }
 
-            ImGui::BeginDisabled(busy);
-            int backendIndex = static_cast<int>(app.lbmBackend);
-            const char* backendNames[] = {"GPU (LBM)", "CPU (LBM, multithreaded)", "Naive (potential flow)"};
-            ImGui::SetNextItemWidth(220);
-            if (ImGui::Combo("Backend", &backendIndex, backendNames, 3)) {
-                app.lbmBackend = static_cast<SolverBackend>(backendIndex);
-                app.lbmValid = false;  // different solver object entirely, needs re-init
-                app.lbmRunning = false;
-            }
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "GPU: fast LBM, but SDL_GPU caps any single buffer at\n"
-                    "4GiB — roughly resolution 460-480 for D3Q19 (populations\n"
-                    "are stored as half precision, compute stays float32 — see\n"
-                    "LbmSolver.cpp) — regardless of available GPU memory.\n"
-                    "CPU: the same LBM physics, no such ceiling (only system\n"
-                    "RAM), parallelized across your CPU cores, but far slower\n"
-                    "than the GPU path even so.\n"
-                    "Naive: not LBM at all — inviscid potential flow (one\n"
-                    "scalar field per cell instead of LBM's 15-19), reaching\n"
-                    "far higher resolutions than either, at the cost of no\n"
-                    "viscosity and no wake/separation behind the model — see\n"
-                    "its own note further down.");
-            }
-
-            if (isNaive) {
+            if (isPanel) {
+                ImGui::TextDisabled(
+                    "3D Lifting Panel Method: desingularized surface source panels\n"
+                    "+ spanwise trailing-edge Kutta horseshoe vortex wake.\n"
+                    "Generates circulation, Lift, wingtip vortices, and Induced Drag.");
+            } else if (isNaive) {
                 ImGui::TextDisabled(
                     "Steady, inviscid potential flow — fast, resolution-unbounded\n"
                     "(system RAM only), but no viscosity: no separation, no\n"
@@ -4979,6 +5088,9 @@ void DrawUI(AppState& app) {
                             LbmReference::Params{app.lbmParams.tau, app.lbmParams.inletVelocity,
                                                   app.lbmParams.reverseFlow, app.lbmParams.freeSlipY,
                                                   app.lbmParams.freeSlipZ, app.lbmParams.smagorinskyCs});
+                    } else if (IsPanelBackend(app.lbmBackend)) {
+                        app.panelSolver.SetParams(
+                            PanelSolver::Params{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow});
                     } else {
                         app.potentialFlow.SetParams(
                             PotentialFlowSolver::Params{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow});
@@ -5004,7 +5116,7 @@ void DrawUI(AppState& app) {
                     "(10000 mm/s = 10 m/s ≈ 36 km/h, a typical RC airspeed).");
             }
 
-            if (!isNaive) {
+            if (isLbm) {
                 // app.lbmTauAtomic — see its own comment — is read here
                 // lock-free instead of locking app.lbmMutex every frame
                 // (ImGui's SliderFloat needs a plain float* to mutate
@@ -5053,7 +5165,7 @@ void DrawUI(AppState& app) {
             // Both LBM backends support this now (GPU and CPU reference) —
             // not Naive (PotentialFlowSolver), which has no concept of a
             // domain-edge boundary condition to begin with.
-            if (!isNaive) {
+            if (isLbm) {
                 auto applyFreeSlip = [&]() {
                     std::lock_guard<std::mutex> lock(app.lbmMutex);
                     if (app.lbmValid) {
@@ -5091,14 +5203,14 @@ void DrawUI(AppState& app) {
             // (a 6-neighbour average vs. a full collide+stream over 15-19
             // directions — see PotentialFlowSolver::Step's comment), so a
             // useful range for it goes well past 20.
-            ImGui::SliderInt(isNaive ? "Sweeps/tick" : "Substeps/tick", &app.lbmSubstepsPerFrame, 1,
+            ImGui::SliderInt(!isLbm ? "Sweeps/tick" : "Substeps/tick", &app.lbmSubstepsPerFrame, 1,
                               isNaive ? 500 : 20);
             if (ImGui::IsItemHovered()) {
-                if (isNaive) {
+                if (!isLbm) {
                     ImGui::SetTooltip(
                         "The solver runs continuously on its own background\n"
                         "thread, independent of the render/UI frame rate — this\n"
-                        "is how many red-black SOR sweeps it does per iteration\n"
+                        "is how many relaxation sweeps it does per iteration\n"
                         "of that loop. More sweeps per tick converges faster in\n"
                         "wall-clock time but makes each tick take longer.");
                 } else {
@@ -5110,7 +5222,7 @@ void DrawUI(AppState& app) {
                 }
             }
 
-            if (!isNaive) {
+            if (isLbm) {
                 ImGui::Checkbox("Start flow at mid-speed/pressure", &app.lbmSeedMidSpeed);
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip(
@@ -5233,6 +5345,8 @@ void DrawUI(AppState& app) {
                         StepSolverLocked(app, app.lbmSubstepsPerFrame);
                     } else if (app.lbmBackend == SolverBackend::CPU) {
                         StepReferenceLocked(app, app.lbmSubstepsPerFrame);
+                    } else if (IsPanelBackend(app.lbmBackend)) {
+                        StepPanelLocked(app, app.lbmSubstepsPerFrame);
                     } else {
                         StepPotentialFlowLocked(app, app.lbmSubstepsPerFrame);
                     }
@@ -5263,9 +5377,13 @@ void DrawUI(AppState& app) {
                 statsCopy.hasNaN = app.lbmStatsHasNaNAtomic.load(std::memory_order_relaxed);
                 statsCopy.valid = app.lbmStatsValidAtomic.load(std::memory_order_relaxed);
                 if (isNaive) {
-                    ImGui::Text("Model: potential flow   Sweeps: %d", app.lbmStepCount.load());
+                    ImGui::Text("Model: potential flow (CPU)   Sweeps: %d", app.lbmStepCount.load());
+                } else if (isPanel) {
+                    ImGui::Text("Model: 3D Panel + Wake (%s)   Sweeps: %d",
+                                app.lbmBackend == SolverBackend::PanelGPU ? "GPU" : "CPU", app.lbmStepCount.load());
                 } else {
-                    ImGui::Text("Model: %s   Steps: %d", LatticeModelName(app.lbmModel), app.lbmStepCount.load());
+                    ImGui::Text("Model: %s (%s)   Steps: %d", LatticeModelName(app.lbmModel),
+                                app.lbmBackend == SolverBackend::GPU ? "GPU" : "CPU", app.lbmStepCount.load());
                 }
                 if (statsCopy.valid) {
                     ImGui::Text("Density: avg %.4f  [%.4f, %.4f]", statsCopy.avgDensity, statsCopy.minDensity,
@@ -6149,6 +6267,7 @@ int main(int, char**) {
     app.voxelRenderer.Shutdown();
     app.overlayRenderer.Shutdown();
     app.lbmSolver.Shutdown();
+    app.panelSolver.Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui_ImplSDLGPU3_Shutdown();
     ImGui::DestroyContext();

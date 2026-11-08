@@ -14,6 +14,7 @@
 #include "../FlowCraft/GpuShaders.h"
 #include "../FlowCraft/LbmReference.h"
 #include "../FlowCraft/LbmSolver.h"
+#include "../FlowCraft/PanelSolver.h"
 #include "../FlowCraft/VoxelGrid.h"
 
 int main() {
@@ -76,6 +77,77 @@ int main() {
         if (!ok) return 1;
         gpu.Shutdown();
     }
+
+    // ── Test 3D Lifting Panel Method (PanelGPU vs PanelCPU) on an inclined wing ──
+    {
+        VoxelGrid grid;
+        grid.nx = 48; grid.ny = 32; grid.nz = 24; grid.cellSize = 1.0f;
+        grid.solid.assign(grid.CellCount(), 0);
+        grid.signedDistance.assign(grid.CellCount(), 1e30f);
+        // Inclined ellipsoid wing at 10 deg angle of attack so lifting wake strips are active
+        const float cx = 20.0f, cy = 16.0f, cz = 12.0f;
+        const float cosA = std::cos(0.1745f), sinA = std::sin(0.1745f);
+        for (int z = 0; z < grid.nz; ++z)
+            for (int y = 0; y < grid.ny; ++y)
+                for (int x = 0; x < grid.nx; ++x) {
+                    float dx = (x + 0.5f) - cx;
+                    float dy = (y + 0.5f) - cy;
+                    float dz = (z + 0.5f) - cz;
+                    float rx =  dx * cosA + dz * sinA;
+                    float rz = -dx * sinA + dz * cosA;
+                    float d = (std::sqrt((rx / 7.0f) * (rx / 7.0f) +
+                                         (dy / 9.0f) * (dy / 9.0f) +
+                                         (rz / 2.2f) * (rz / 2.2f)) - 1.0f) * 3.0f;
+                    size_t i = grid.Index(x, y, z);
+                    grid.signedDistance[i] = d;
+                    grid.solid[i] = d < 0.0f ? 1 : 0;
+                }
+
+        PanelSolver::Params pp;
+        pp.inletVelocity = 0.08f;
+        pp.reverseFlow = false;
+
+        PanelSolver panelGpu, panelCpu;
+        if (!panelGpu.Init(dev, true, grid, pp)) {
+            std::printf("PanelGPU Init failed: %s\n", panelGpu.LastError().c_str());
+            return 1;
+        }
+        if (!panelCpu.Init(nullptr, false, grid, pp)) {
+            std::printf("PanelCPU Init failed: %s\n", panelCpu.LastError().c_str());
+            return 1;
+        }
+        panelGpu.Step(40);
+        panelCpu.Step(40);
+
+        std::vector<float> g = panelGpu.ReadbackField();
+        std::vector<float> c = panelCpu.ReadbackField();
+        double maxRho = 0, maxU = 0, sumU = 0; size_t n = 0; bool nan = false;
+        double sumFx = 0, sumFz = 0;
+        for (size_t i = 0; i < grid.CellCount(); ++i) {
+            for (int k = 0; k < 4; ++k) if (!std::isfinite(g[i * 4 + k])) nan = true;
+            if (grid.solid[i]) {
+                sumFx += g[i * 4 + 1];
+                sumFz += g[i * 4 + 3];
+                continue;
+            }
+            maxRho = std::max<double>(maxRho, std::fabs(g[i * 4] - c[i * 4]));
+            for (int k = 1; k < 4; ++k) {
+                double e = std::fabs(g[i * 4 + k] - c[i * 4 + k]);
+                maxU = std::max(maxU, e); sumU += e; ++n;
+            }
+        }
+        std::printf("PanelMethod (panels=%zu, wakeStrips=%zu, LiftFz=%.5f, InducedFx=%.5f): max|drho|=%.6f  max|du|=%.6f  mean|du|=%.7f%s\n",
+                    panelGpu.NumPanels(), panelGpu.NumWakeStrips(),
+                    sumFz, sumFx,
+                    maxRho, maxU, sumU / double(n), nan ? "  NaN!" : "");
+        bool ok = !nan && panelGpu.NumPanels() > 0 && panelGpu.NumWakeStrips() > 0 &&
+                  maxRho < 1e-4 && maxU < 1e-4;
+        std::printf("  -> %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+        panelGpu.Shutdown();
+        panelCpu.Shutdown();
+    }
+
     SDL_DestroyGPUDevice(dev);
     return 0;
 }
