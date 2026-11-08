@@ -7,6 +7,6 @@ FlowCraft allows you to load any 3D object (in STL format), and then using the L
 
 Due to the large RAM and compute resources required for CFD, I'm not sure how useful this really is as a desktop application but it is fun.
 
-Several visualisations are available; "smoke" trails, colour map, and voxel space.
+Several visualisations are available; "smoke" trails, colour map (pressure/speed), and voxel space.
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot2.jpg" alt="Colour map" width="500" />
