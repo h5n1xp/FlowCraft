@@ -2,6 +2,9 @@ name: build
 
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -19,20 +22,85 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build pkg-config libasound2-dev libpulse-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
             libxkbcommon-dev libwayland-dev libdrm-dev libgbm-dev libgl1-mesa-dev libegl1-mesa-dev libdbus-1-dev \
-            libudev-dev libvulkan-dev
+            libudev-dev libvulkan-dev zip
 
-      - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+      - name: Configure (with static SDL3)
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DFLOWCRAFT_STATIC_SDL3=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Upload build
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item build/Release/FlowCraft.exe ./FlowCraft.exe
+          Compress-Archive -Path ./FlowCraft.exe -DestinationPath ./FlowCraft-Windows.zip -Force
+
+      - name: Package release archive (macOS .app bundle)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p FlowCraft.app/Contents/MacOS FlowCraft.app/Contents/Resources
+          cp build/FlowCraft FlowCraft.app/Contents/MacOS/FlowCraft
+          chmod +x FlowCraft.app/Contents/MacOS/FlowCraft
+          if [ -f FlowCraft/AppIcon.icns ]; then
+            cp FlowCraft/AppIcon.icns FlowCraft.app/Contents/Resources/AppIcon.icns
+          fi
+          cat > FlowCraft.app/Contents/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>FlowCraft</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.flowcraft.app</string>
+            <key>CFBundleName</key>
+            <string>FlowCraft</string>
+            <key>CFBundleDisplayName</key>
+            <string>FlowCraft</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.2</string>
+            <key>CFBundleVersion</key>
+            <string>2</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - FlowCraft.app
+          ditto -c -k --sequesterRsrc --keepParent FlowCraft.app FlowCraft-macOS.zip
+
+      - name: Package release archive (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x build/FlowCraft
+          zip -j FlowCraft-Linux.zip build/FlowCraft
+
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
           name: FlowCraft-${{ runner.os }}
           path: |
-            build/FlowCraft
-            build/Release/FlowCraft.exe
-            build/Release/SDL3.dll
-            build/SDL3.dll
+            FlowCraft.exe
+            FlowCraft-Windows.zip
+            FlowCraft-macOS.zip
+            FlowCraft-Linux.zip
+
+      - name: Update GitHub Release assets
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            gh release upload Windows FlowCraft.exe FlowCraft-Windows.zip --clobber
+          elif [ "${RUNNER_OS}" = "macOS" ]; then
+            gh release upload Windows FlowCraft-macOS.zip --clobber
+          elif [ "${RUNNER_OS}" = "Linux" ]; then
+            gh release upload Windows FlowCraft-Linux.zip --clobber
+          fi

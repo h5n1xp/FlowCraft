@@ -21,9 +21,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-find_package(SDL3 CONFIG QUIET)
+option(FLOWCRAFT_STATIC_SDL3 "Fetch and statically link SDL3 into the executable" OFF)
+
+if(NOT FLOWCRAFT_STATIC_SDL3)
+    find_package(SDL3 CONFIG QUIET)
+endif()
 if(NOT SDL3_FOUND)
-    message(STATUS "System SDL3 not found — fetching and building it from source")
+    message(STATUS "Building SDL3 from source (static library)")
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
     include(FetchContent)
     FetchContent_Declare(SDL3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
