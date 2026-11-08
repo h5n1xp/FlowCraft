@@ -3700,7 +3700,7 @@ void DrawFusionRibbon(AppState& app, bool busy) {
             {WorkspaceTab::Model, "1. MODEL & ORIENT", app.meshLoaded},
             {WorkspaceTab::Voxelize, "2. VOXELIZE", app.voxelGridValid},
             {WorkspaceTab::Simulate, "3. SIMULATION SETTINGS", app.lbmValid},
-            {WorkspaceTab::Inspect, "4. FLOW OVERLAY", app.overlayValid},
+            {WorkspaceTab::Inspect, "4. FLOW VISUALISATION", app.overlayValid},
         };
 
         for (const TabDef& t : tabs) {
@@ -4081,7 +4081,7 @@ void DrawFusionInspector(AppState& app, bool busy) {
             panelTitle = "Inspector — 3. Simulation Settings###FusionInspector";
             break;
         case WorkspaceTab::Inspect:
-            panelTitle = "Inspector — 4. Flow Overlay###FusionInspector";
+            panelTitle = "Inspector — 4. Flow Visualisation###FusionInspector";
             break;
     }
 
