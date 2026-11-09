@@ -1,6 +1,6 @@
 # FlowCraft
 
-##Background
+### Background
 Around a year ago I purchased a fantastic book called "Shaping the Vulcan" by Stephen Liddle, which covers the postwar period of aerodynamic research by the British aircraft industry.<br>
 <img src="ShapingTheVulcan.jpg" alt="Book cover" width="100" /><br>
 
