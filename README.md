@@ -11,11 +11,13 @@ My relatively old MacStudio Ultra can run the LBM GPU visualisation for 22 milli
 
 Due to the large RAM and compute resources required for CFD, I'm not sure how useful this really is as a desktop application but it is fun.
 
-Several visualisations are available; "smoke" trails, colour map (pressure/speed), and voxel space.
+Several visualisations are available; "smoke" trails, colour map (pressure/speed), Iso-Surface, and voxel space.
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot2.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot3.jpg" alt="LBM Turbulence" width="500" />
 <img src="ScreenShot5.jpg" alt="LBM Turbulence" width="500" />
+<img src="ScreenShot6.jpg" alt="LBM Turbulence" width="500" />
+<img src="ScreenShot7.jpg" alt="LBM Turbulence" width="500" />
 
 As a nice bonus, the visualiser can also show pressure stress on the airframe, which can help when designing a model to see where extra support might be needed.<br>
 <img src="ScreenShot4.jpg" alt="Airframe Stress" width="500" />
