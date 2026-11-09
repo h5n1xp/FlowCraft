@@ -10,3 +10,13 @@ Due to the large RAM and compute resources required for CFD, I'm not sure how us
 Several visualisations are available; "smoke" trails, colour map (pressure/speed), and voxel space.
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot2.jpg" alt="Colour map" width="500" />
+
+## License
+
+FlowCraft is licensed under the [GNU Lesser General Public License v3.0 (LGPL-3.0)](LICENSE).
+
+Third-party libraries and assets retain their respective licenses and copyrights:
+- **Dear ImGui** (`FlowCraft/ThirdParty/imgui`) — MIT License.
+- **SDL3** — zlib License.
+- *Shaping the Vulcan* book cover image (`ShapingTheVulcan.jpg`) — property of its respective copyright holder, shown for commentary/reference.
+

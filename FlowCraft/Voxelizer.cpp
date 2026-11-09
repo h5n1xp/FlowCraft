@@ -204,84 +204,93 @@ VoxelGrid Voxelizer::Voxelize(const std::vector<Vec3>& positions, const std::vec
     // own slab, so there's no data race despite every thread touching the
     // same underlying arrays.
     float conservativeRadius = cellSize * 0.8660254f;  // sqrt(3)/2
+    float edgeTieTol = cellSize * 1e-3f;
     size_t triangleCount = indices.size() / 3;
-    ParallelForZ(grid.nz, [&](int zBegin, int zEnd, unsigned int /*threadIndex*/) {
-        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-            if ((i / 3) % 256 == 0) {
-                report(0.5f * static_cast<float>(i / 3) / static_cast<float>(std::max<size_t>(triangleCount, 1)));
-            }
+    {
+        // Tracks |Dot(center - closest, unitNormal)| for the triangle that
+        // currently owns grid.signedDistance[idx]. At a sharp edge or vertex
+        // (such as a thin wing trailing edge), adjacent faces share the exact
+        // same closest point on that edge and therefore produce equal unsigned
+        // distances (up to floating-point rounding), while one face's plane
+        // normal points toward the query cell and the other's points away.
+        // Breaking ties by the larger |Dot(diff, unitNormal)| selects the
+        // exact sign of the angle-bisector pseudonormal (n1 + n2), avoiding
+        // arbitrary sign flips behind trailing edges. Scoped to this block so
+        // the buffer is freed before `label` is allocated for the flood fill.
+        std::vector<float> bestNormalProj(grid.CellCount(), -1.0f);
+        ParallelForZ(grid.nz, [&](int zBegin, int zEnd, unsigned int /*threadIndex*/) {
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                if ((i / 3) % 256 == 0) {
+                    report(0.5f * static_cast<float>(i / 3) / static_cast<float>(std::max<size_t>(triangleCount, 1)));
+                }
 
-            const Vec3& v0 = positions[indices[i]];
-            const Vec3& v1 = positions[indices[i + 1]];
-            const Vec3& v2 = positions[indices[i + 2]];
+                const Vec3& v0 = positions[indices[i]];
+                const Vec3& v1 = positions[indices[i + 1]];
+                const Vec3& v2 = positions[indices[i + 2]];
 
-            Vec3 triMin{std::min({v0.x, v1.x, v2.x}), std::min({v0.y, v1.y, v2.y}), std::min({v0.z, v1.z, v2.z})};
-            Vec3 triMax{std::max({v0.x, v1.x, v2.x}), std::max({v0.y, v1.y, v2.y}), std::max({v0.z, v1.z, v2.z})};
+                Vec3 rawNormal = Cross(v1 - v0, v2 - v0);
+                float normalLen = Length(rawNormal);
+                if (normalLen <= 1e-12f) continue;
+                Vec3 unitNormal = rawNormal * (1.0f / normalLen);
 
-            // minX/maxX (grid-x, which is world Y) built from the
-            // triangle's world-Y extent, and minY/maxY (grid-y, world X)
-            // from its world-X extent — swapped to match CellCenter's
-            // mapping (see VoxelGrid.h's comment), so this still bounds
-            // the exact same world-space region the triangle actually
-            // occupies.
-            int minX = std::max(FloorToInt((triMin.y - conservativeRadius - grid.origin.y) / cellSize), 0);
-            int minY = std::max(FloorToInt((triMin.x - conservativeRadius - grid.origin.x) / cellSize), 0);
-            int minZ = std::max(FloorToInt((triMin.z - conservativeRadius - grid.origin.z) / cellSize), 0);
-            int maxX = std::min(CeilToInt((triMax.y + conservativeRadius - grid.origin.y) / cellSize), grid.nx - 1);
-            int maxY = std::min(CeilToInt((triMax.x + conservativeRadius - grid.origin.x) / cellSize), grid.ny - 1);
-            int maxZ = std::min(CeilToInt((triMax.z + conservativeRadius - grid.origin.z) / cellSize), grid.nz - 1);
+                Vec3 triMin{std::min({v0.x, v1.x, v2.x}), std::min({v0.y, v1.y, v2.y}), std::min({v0.z, v1.z, v2.z})};
+                Vec3 triMax{std::max({v0.x, v1.x, v2.x}), std::max({v0.y, v1.y, v2.y}), std::max({v0.z, v1.z, v2.z})};
 
-            int zLo = std::max(minZ, zBegin);
-            int zHi = std::min(maxZ, zEnd - 1);
-            if (zLo > zHi) continue;  // this triangle doesn't reach this thread's slab at all
+                // minX/maxX (grid-x, which is world Y) built from the
+                // triangle's world-Y extent, and minY/maxY (grid-y, world X)
+                // from its world-X extent — swapped to match CellCenter's
+                // mapping (see VoxelGrid.h's comment), so this still bounds
+                // the exact same world-space region the triangle actually
+                // occupies.
+                int minX = std::max(FloorToInt((triMin.y - conservativeRadius - grid.origin.y) / cellSize), 0);
+                int minY = std::max(FloorToInt((triMin.x - conservativeRadius - grid.origin.x) / cellSize), 0);
+                int minZ = std::max(FloorToInt((triMin.z - conservativeRadius - grid.origin.z) / cellSize), 0);
+                int maxX = std::min(CeilToInt((triMax.y + conservativeRadius - grid.origin.y) / cellSize), grid.nx - 1);
+                int maxY = std::min(CeilToInt((triMax.x + conservativeRadius - grid.origin.x) / cellSize), grid.ny - 1);
+                int maxZ = std::min(CeilToInt((triMax.z + conservativeRadius - grid.origin.z) / cellSize), grid.nz - 1);
 
-            // Sign comes from this triangle's own winding (its normal
-            // should point outward/into fluid for a properly-wound mesh),
-            // tested at the closest point — NOT from grid.solid: that
-            // flag's own "necessary bound for true overlap" margin (see
-            // this function's header comment) is deliberately
-            // over-inclusive near a convex corner/edge, by design,
-            // because it only needs to give the flood fill below a shell
-            // with no holes. A query point just outside the box near a
-            // corner can land within conservativeRadius of that corner's
-            // vertex without truly being inside — grid.solid correctly
-            // (for its own purpose) calls that solid anyway, but a signed
-            // distance that followed grid.solid's sign would then be
-            // wrong in exactly the region InterpolatedBounceBack most
-            // needs it to be right: right at a sharp feature. Computing
-            // the sign straight from geometry here avoids inheriting that
-            // margin at all.
-            //
-            // Known trade-off, kept deliberately: this is unreliable
-            // wherever two surfaces sit close together (a thin trailing
-            // edge), since a nearby cell's closest point can alternate
-            // between triangles on opposite sides of the thin feature
-            // from one cell to the next, flipping sign and showing up as
-            // visible speckling in the slice view right behind such a
-            // feature. Reverting to grid.solid's own sign there instead
-            // (tried) traded that for the whole slice boundary losing its
-            // smooth, curved look everywhere — worse overall for this
-            // app's models (mostly smooth curvature, with the occasional
-            // thin edge) than this scheme's own localized speckling.
-            Vec3 normal = Cross(v1 - v0, v2 - v0);  // only its sign matters below, not normalized
-            for (int z = zLo; z <= zHi; ++z) {
-                for (int y = minY; y <= maxY; ++y) {
-                    for (int x = minX; x <= maxX; ++x) {
-                        size_t idx = grid.Index(x, y, z);
-                        Vec3 center = grid.CellCenter(x, y, z);
-                        Vec3 closest = ClosestPointOnTriangle(center, v0, v1, v2);
-                        Vec3 diff = center - closest;
-                        float dist = Length(diff);
-                        float signedDist = Dot(diff, normal) < 0.0f ? -dist : dist;
-                        if (std::fabs(signedDist) < std::fabs(grid.signedDistance[idx])) {
-                            grid.signedDistance[idx] = signedDist;
+                int zLo = std::max(minZ, zBegin);
+                int zHi = std::min(maxZ, zEnd - 1);
+                if (zLo > zHi) continue;  // this triangle doesn't reach this thread's slab at all
+
+                // Within the conservativeRadius shell, sign comes from the
+                // triangle geometry (with shared-edge ties broken by
+                // |Dot(diff, unitNormal)|) rather than grid.solid, because
+                // grid.solid's conservativeRadius margin is deliberately
+                // over-inclusive so the flood fill below gets a watertight
+                // 6-connected shell. Cells outside conservativeRadius are
+                // reconciled against the flood-fill classification after Step 3.
+                for (int z = zLo; z <= zHi; ++z) {
+                    for (int y = minY; y <= maxY; ++y) {
+                        for (int x = minX; x <= maxX; ++x) {
+                            size_t idx = grid.Index(x, y, z);
+                            Vec3 center = grid.CellCenter(x, y, z);
+                            Vec3 closest = ClosestPointOnTriangle(center, v0, v1, v2);
+                            Vec3 diff = center - closest;
+                            float dist = Length(diff);
+                            float normalDot = Dot(diff, unitNormal);
+                            float absNormalDot = std::fabs(normalDot);
+                            float signedDist = normalDot < 0.0f ? -dist : dist;
+                            float bestDist = std::fabs(grid.signedDistance[idx]);
+                            if (dist + edgeTieTol < bestDist) {
+                                grid.signedDistance[idx] = signedDist;
+                                bestNormalProj[idx] = absNormalDot;
+                            } else if (dist <= bestDist + edgeTieTol) {
+                                if (absNormalDot > bestNormalProj[idx]) {
+                                    float minDist = std::min(dist, bestDist);
+                                    grid.signedDistance[idx] = normalDot < 0.0f ? -minDist : minDist;
+                                    bestNormalProj[idx] = absNormalDot;
+                                } else if (dist < bestDist) {
+                                    grid.signedDistance[idx] = grid.signedDistance[idx] < 0.0f ? -dist : dist;
+                                }
+                            }
+                            if (dist <= conservativeRadius) grid.solid[idx] = 1;
                         }
-                        if (dist <= conservativeRadius) grid.solid[idx] = 1;
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     // Find every fluid cell reachable from a domain corner (guaranteed
     // fluid: the padding keeps it outside the model) — anything left
@@ -444,22 +453,29 @@ VoxelGrid Voxelizer::Voxelize(const std::vector<Vec3>& positions, const std::vec
         }
     });
 
-    // Every cell the rasterization pass actually got within range of a
-    // triangle already has the right sign (from that triangle's own
-    // normal — see the rasterization loop's comment), so this only
-    // handles what's left: a cell the flood fill just turned solid here
-    // in Step 3 that no triangle ever got close enough to touch at all
-    // (a deep, fully-enclosed interior pocket) — still sitting at the
-    // +infinity "nothing nearby" sentinel it was initialized to. Flipping
-    // that to -infinity keeps the sign convention correct for it too
-    // (truly solid, truly far from the surface) without touching any
-    // cell that already has a real, correctly-signed distance.
+    // Reconcile signedDistance outside the conservativeRadius boundary shell
+    // against the flood-fill classification:
+    //  - Every cell with !grid.solid[i] lies outside the watertight
+    //    conservativeRadius shell and was reached from the exterior seed, so
+    //    it is strictly in the fluid (true signed distance > +conservativeRadius).
+    //    Forcing +d corrects any wake/exterior cells that fell inside the 3D
+    //    AABB of a skewed triangle whose back-plane faced them.
+    //  - Every cell with grid.solid[i] and d > conservativeRadius was marked
+    //    solid by the interior flood fill rather than the surface shell, so
+    //    it is strictly inside the solid interior (true signed distance <
+    //    -conservativeRadius, including flipping untouched +infinity cells to
+    //    -infinity).
+    // Cells within the conservativeRadius surface shell keep their exact
+    // triangle-derived sub-cell signed distance.
     ParallelForZ(grid.nz, [&](int zBegin, int zEnd, unsigned int /*threadIndex*/) {
         size_t base = static_cast<size_t>(zBegin) * cellsPerLayer;
         size_t end = static_cast<size_t>(zEnd) * cellsPerLayer;
         for (size_t i = base; i < end; ++i) {
-            if (grid.solid[i] && grid.signedDistance[i] == std::numeric_limits<float>::infinity()) {
-                grid.signedDistance[i] = -std::numeric_limits<float>::infinity();
+            float d = std::fabs(grid.signedDistance[i]);
+            if (!grid.solid[i]) {
+                grid.signedDistance[i] = d;
+            } else if (d > conservativeRadius) {
+                grid.signedDistance[i] = -d;
             }
         }
     });

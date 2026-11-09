@@ -314,6 +314,7 @@ OverlayMesh FieldOverlay::BuildSliceMeshFromRange(const VoxelGrid& grid, const s
             float alpha;
             if (hasSdf) {
                 float sdf = grid.signedDistance[cell];
+                if (!grid.solid[cell]) sdf = std::fabs(sdf);
                 if (std::isfinite(sdf)) {
                     // t=0 at half a cell inside solid, t=1 at half a cell
                     // into fluid, smoothstepped in between — the ramp's

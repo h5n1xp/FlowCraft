@@ -229,9 +229,12 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         Vec3 p = b.posWeighted * (1.0f / b.areaSum);
         float radius = std::max(1.35f, std::sqrt(b.areaSum / kPi));
         float eps = 0.85f * radius;
-        // Place the desingularized source point inside the solid body along -n
-        // so the self-influence is nonsingular and strictly diagonally dominant.
-        Vec3 srcPos = p - n * (0.65f * radius);
+        // Keep the desingularized source point inside its own boundary solid
+        // voxel (at most 0.4 lattice units inward along -n) so upper/lower
+        // wing panels never push their sources across a thin wing into the
+        // fluid on the opposite side.
+        float inwardOffset = std::min(0.4f, 0.25f * radius);
+        Vec3 srcPos = p - n * inwardOffset;
 
         SurfacePanel panel;
         panel.collocation = p;
@@ -244,7 +247,9 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
     }
 
     // 2. Build spanwise lifting strips (Horseshoe Vortex Lattice + Trailing-Edge
-    // Kutta condition). Divide the model's Y-span into up to 48 strips.
+    // Kutta condition). Divide the model's Y-span into up to 48 strips, using
+    // only lifting-surface boundary samples (|normal.z| >= 0.35) so vertical
+    // tail fins and fuselage sidewalls do not skew the strip chord or camber.
     int numStrips = std::clamp((maxY - minY + 1) / 3, 6, 48);
     float stripWidth = spanY / static_cast<float>(numStrips);
 
@@ -254,10 +259,12 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         int countMin = 0, countMax = 0;
         float zSum = 0.0f;
         int totalCount = 0;
+        Vec3 camberNormalSum{0.0f, 0.0f, 0.0f};
     };
     std::vector<StripGeom> stripGeoms(numStrips);
 
     for (const BoundarySample& s : samples) {
+        if (std::fabs(s.normal.z) < 0.35f) continue;
         int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY)) / stripWidth),
                               0, numStrips - 1);
         StripGeom& g = stripGeoms[sIdx];
@@ -267,7 +274,10 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         ++g.totalCount;
     }
 
+    bool rev = params_.reverseFlow;
+    float flowSign = rev ? -1.0f : 1.0f;
     for (const BoundarySample& s : samples) {
+        if (std::fabs(s.normal.z) < 0.35f) continue;
         int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY)) / stripWidth),
                               0, numStrips - 1);
         StripGeom& g = stripGeoms[sIdx];
@@ -281,9 +291,15 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
             g.zAtXMax += s.surfacePos.z;
             ++g.countMax;
         }
+        // Flip lower-surface normals (+Z-ward) so averaging upper and lower
+        // skins cancels symmetric thickness slope and isolates mean camber +
+        // incidence, weighted toward the aft Kutta region.
+        float xNorm = rev ? ((g.xMax - s.surfacePos.x) / chord) : ((s.surfacePos.x - g.xMin) / chord);
+        float kuttaWeight = 0.5f + std::clamp(xNorm, 0.0f, 1.0f);
+        Vec3 upN = (s.normal.z >= 0.0f) ? s.normal : (s.normal * -1.0f);
+        g.camberNormalSum = g.camberNormalSum + upN * (s.area * kuttaWeight);
     }
 
-    bool rev = params_.reverseFlow;
     for (int sIdx = 0; sIdx < numStrips; ++sIdx) {
         const StripGeom& g = stripGeoms[sIdx];
         if (g.totalCount < 3 || g.xMax <= g.xMin + 1.0f) continue;
@@ -306,15 +322,19 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         float xThreeQuarter = xLE + 0.75f * (xTE - xLE);
         float zThreeQuarter = zLE + 0.75f * (zTE - zLE);
 
-        // Camber line tangent from LE to TE: T = (xTE - xLE, 0, zTE - zLE).
-        // Outward (+Z-ish) camber normal perpendicular to T in the (X, Z) plane:
         float dx = xTE - xLE;
         float dz = zTE - zLE;
-        float flowSign = rev ? -1.0f : 1.0f;
-        // When flow goes along +X (dx > 0), a nose-up pitch has zLE > zTE (dz < 0),
-        // so normal (-dz, 0, dx) has positive X component and positive Z component,
-        // meaning U_inf . n_camber > 0, driving downwash and positive Lift (+Z).
-        Vec3 camberN = Normalize(Vec3{-flowSign * dz, 0.0f, std::fabs(dx)});
+        Vec3 chordN = Normalize(Vec3{-flowSign * dz, 0.0f, std::fabs(dx)});
+        Vec3 surfCamberN = Length(g.camberNormalSum) > 1e-4f
+                               ? Normalize(Vec3{g.camberNormalSum.x, 0.0f, std::max(0.1f, g.camberNormalSum.z)})
+                               : chordN;
+        Vec3 camberN = Normalize(chordN * 0.5f + surfCamberN * 0.5f);
+        // Clamp effective camber/incidence slope to a physical pre-stall range
+        // (|nx / nz| <= tan(20 deg) ≈ 0.36) so blunt noses or fuselage steps
+        // cannot command unphysical stall circulation.
+        constexpr float kMaxTanAlpha = 0.36f;
+        camberN.x = std::clamp(camberN.x, -kMaxTanAlpha * camberN.z, kMaxTanAlpha * camberN.z);
+        camberN = Normalize(camberN);
 
         WakeStrip ws;
         ws.boundA = Vec3{xQuarter, yLeft, zQuarter};
@@ -323,7 +343,11 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         ws.camberNormal = camberN;
         ws.chord = std::fabs(dx);
         ws.span = stripWidth;
-        float coreR = std::max(1.5f, 0.35f * stripWidth);
+        // Scale the vortex core radius with the local chord so the single
+        // quarter-chord bound vortex represents a distributed chordwise vortex
+        // sheet rather than a concentrated line singularity punching through
+        // the wing thickness.
+        float coreR = std::max({1.5f, 0.5f * stripWidth, 0.28f * ws.chord});
         ws.coreSq = coreR * coreR;
         ws.gamma = 0.0f;
         wakeStrips_.push_back(ws);
@@ -347,17 +371,19 @@ void PanelSolver::RebuildInfluenceMatrices() {
     for (size_t i = 0; i < P; ++i) {
         const Vec3& ci = panels_[i].collocation;
         const Vec3& ni = panels_[i].normal;
+        float offDiagSum = 0.0f;
         for (size_t j = 0; j < P; ++j) {
             Vec3 u = SourceUnitVelocityCPU(ci, panels_[j].sourcePos, panels_[j].epsSq);
-            panelToPanel_[i * P + j] = Dot(u, ni);
+            float val = Dot(u, ni);
+            panelToPanel_[i * P + j] = val;
+            if (j != i) offDiagSum += std::fabs(val);
         }
-        panels_[i].selfDiag = std::max(1e-4f, panelToPanel_[i * P + i]);
-
-        for (size_t s = 0; s < W; ++s) {
-            Vec3 u = HorseshoeUnitVelocityCPU(ci, wakeStrips_[s].boundA, wakeStrips_[s].boundB,
-                                              wakeStrips_[s].coreSq, flowSign, wakeLen);
-            wakeToPanel_[i * W + s] = Dot(u, ni);
-        }
+        // Analytical planar Gauss-law self-influence (sigma/2 = 2*pi*q / area)
+        // plus strict diagonal dominance so the thickness source relaxation is
+        // unconditionally contractive.
+        float planarSelf = (2.0f * kPi) / std::max(panels_[i].area, 1.0f);
+        panelToPanel_[i * P + i] += planarSelf;
+        panels_[i].selfDiag = std::max({panelToPanel_[i * P + i], 1.15f * offDiagSum, 1e-3f});
     }
 
     for (size_t k = 0; k < W; ++k) {
@@ -367,14 +393,20 @@ void PanelSolver::RebuildInfluenceMatrices() {
             Vec3 u = SourceUnitVelocityCPU(ck, panels_[j].sourcePos, panels_[j].epsSq);
             panelToWake_[k * P + j] = Dot(u, nk);
         }
+        float offDiagWake = 0.0f;
         for (size_t s = 0; s < W; ++s) {
             Vec3 u = HorseshoeUnitVelocityCPU(ck, wakeStrips_[s].boundA, wakeStrips_[s].boundB,
                                               wakeStrips_[s].coreSq, flowSign, wakeLen);
-            wakeToWake_[k * W + s] = Dot(u, nk);
+            float val = Dot(u, nk);
+            wakeToWake_[k * W + s] = val;
+            if (s != k) offDiagWake += std::fabs(val);
         }
-        float diag = wakeToWake_[k * W + k];
-        if (std::fabs(diag) < 1e-4f) diag = (diag >= 0.0f ? 1e-4f : -1e-4f);
-        wakeStrips_[k].selfDiag = diag;
+        // Weissinger 2D thin-airfoil self-influence (-4 / chord per unit
+        // Gamma / 4pi) combined with the 3D horseshoe downwash and strict
+        // diagonal dominance so circulation stays physically bounded.
+        float twoDSelf = -4.0f / std::max(wakeStrips_[k].chord, 1.0f);
+        float diag = std::min(wakeToWake_[k * W + k], twoDSelf);
+        wakeStrips_[k].selfDiag = -std::max({std::fabs(diag), 1.15f * offDiagWake, 1e-3f});
     }
 }
 
@@ -573,13 +605,14 @@ void PanelSolver::StepSurfaceOnly(int sweeps) {
     const Vec3 uInf{signedU, 0.0f, 0.0f};
     constexpr float kRelaxPanel = 0.65f;
     constexpr float kRelaxWake = 0.55f;
-    const float maxQ = 2.5f * params_.inletVelocity * static_cast<float>( std::max({nx_, ny_, nz_}) );
-    const float maxGamma = 1.5f * params_.inletVelocity * static_cast<float>( std::max(nx_, nz_) );
 
     int iterations = std::max(1, sweeps);
     for (int iter = 0; iter < iterations; ++iter) {
         // 1. Gauss-Seidel relaxation of desingularized surface source strengths
-        //    enforcing zero normal velocity (uInf + u_src + u_wake) . n_i = 0.
+        //    solving the non-lifting thickness problem (uInf + u_src) . n_i = 0.
+        //    Decoupling wakeToPanel_ from the thickness source solve prevents
+        //    positive feedback between upper/lower wing panels and the internal
+        //    bound vortex line.
         for (size_t i = 0; i < P; ++i) {
             float rhs = -Dot(uInf, panels_[i].normal);
             const float* rowP = &panelToPanel_[i * P];
@@ -587,12 +620,8 @@ void PanelSolver::StepSurfaceOnly(int sweeps) {
                 if (j == i) continue;
                 rhs -= rowP[j] * panels_[j].sigma;
             }
-            const float* rowW = &wakeToPanel_[i * W];
-            for (size_t s = 0; s < W; ++s) {
-                rhs -= rowW[s] * wakeStrips_[s].gamma;
-            }
-            float targetQ = rhs / panels_[i].selfDiag;
-            targetQ = std::clamp(targetQ, -maxQ, maxQ);
+            float maxQ = 0.5f * params_.inletVelocity * panels_[i].area;
+            float targetQ = std::clamp(rhs / panels_[i].selfDiag, -maxQ, maxQ);
             panels_[i].sigma += kRelaxPanel * (targetQ - panels_[i].sigma);
         }
 
@@ -615,6 +644,9 @@ void PanelSolver::StepSurfaceOnly(int sweeps) {
             float leftG = (k > 0) ? wakeStrips_[k - 1].gamma : 0.0f;
             float rightG = (k + 1 < W) ? wakeStrips_[k + 1].gamma : 0.0f;
             targetG = 0.80f * targetG + 0.10f * (leftG + rightG);
+            // Physical thin-airfoil circulation cap (|CL| <= ~1.6 ->
+            // |Gamma / 4pi| <= 0.14 * uInf * chord).
+            float maxGamma = 0.14f * params_.inletVelocity * wakeStrips_[k].chord;
             targetG = std::clamp(targetG, -maxGamma, maxGamma);
             wakeStrips_[k].gamma += kRelaxWake * (targetG - wakeStrips_[k].gamma);
         }
@@ -749,27 +781,37 @@ void PanelSolver::EvaluateFieldCPU(std::vector<float>& outField) const {
 void PanelSolver::FinalizeReadbackField(std::vector<float>& field) const {
     if (field.size() != cellCount_ * 4 || boundarySolidCells_.empty()) return;
 
-    // 1. Compute Trefftz-plane / Kutta-Joukowski induced drag from the wake
-    //    downwash at each lifting strip so the solid boundary cells include the
-    //    3D vortex-induced drag force alongside the surface Bernoulli pressure.
+    // 1. Compute Trefftz-plane / Kutta-Joukowski induced drag from the
+    //    trailing-vortex wake downwash at each lifting strip plus baseline
+    //    form/skin-friction drag so the solid boundary cells report realistic
+    //    aerodynamic drag alongside the surface Bernoulli pressure.
     const float flowSign = params_.reverseFlow ? -1.0f : 1.0f;
     const float wakeLen = 8.0f * static_cast<float>(std::max({nx_, ny_, nz_, 64}));
+    const Vec3 wakeOffset{flowSign * wakeLen, 0.0f, 0.0f};
     float inducedDragTotal = 0.0f;
     for (size_t s = 0; s < wakeStrips_.size(); ++s) {
         const WakeStrip& ws = wakeStrips_[s];
         Vec3 mid = (ws.boundA + ws.boundB) * 0.5f;
         float downwashZ = 0.0f;
         for (size_t j = 0; j < wakeStrips_.size(); ++j) {
-            Vec3 u = HorseshoeUnitVelocityCPU(mid, wakeStrips_[j].boundA, wakeStrips_[j].boundB,
-                                              wakeStrips_[j].coreSq, flowSign, wakeLen);
-            downwashZ += u.z * wakeStrips_[j].gamma;
+            const Vec3& A = wakeStrips_[j].boundA;
+            const Vec3& B = wakeStrips_[j].boundB;
+            Vec3 Awake = A + wakeOffset;
+            Vec3 Bwake = B + wakeOffset;
+            float coreSq = wakeStrips_[j].coreSq;
+            Vec3 uTrail = VortexSegmentUnitCPU(mid, Awake, A, coreSq) +
+                          VortexSegmentUnitCPU(mid, B, Bwake, coreSq);
+            downwashZ += uTrail.z * wakeStrips_[j].gamma;
         }
         float gamma = ws.gamma * kFourPi;
         inducedDragTotal += std::fabs(gamma * downwashZ) * ws.span;
     }
+    float profileDragTotal =
+        0.012f * (0.5f * params_.inletVelocity * params_.inletVelocity) * static_cast<float>(boundarySolidCells_.size());
+    float totalDrag = inducedDragTotal + profileDragTotal;
     float inducedDragPerBoundaryCell =
         boundarySolidCells_.empty() ? 0.0f
-                                    : (flowSign * inducedDragTotal / static_cast<float>(boundarySolidCells_.size()));
+                                    : (flowSign * totalDrag / static_cast<float>(boundarySolidCells_.size()));
 
     // 2. Populate exposed solid boundary cells with normal Bernoulli pressure
     //    stress (for the 3D Airframe Stress Map) and vertical/side pressure

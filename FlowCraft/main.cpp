@@ -727,6 +727,10 @@ struct AppState {
     WorkspaceTab activeTab = WorkspaceTab::Model;
     bool showInspectorPanel = true;
     bool showTelemetryHud = true;
+    bool telemetryHudInitialized = false;
+    bool telemetryHudUserMoved = false;
+    ImVec2 telemetryHudLastPos{0.0f, 0.0f};
+    ImVec2 telemetryHudLastViewportSize{0.0f, 0.0f};
     bool showProcessingWindow = true;
     bool classicSinglePanelUI = false;
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
@@ -2619,6 +2623,8 @@ void ResetSession(AppState& app) {
     ApplySessionSettings(app, SessionSettings{});  // every field back to its own struct's default
 
     app.meshLoaded = false;
+    app.telemetryHudInitialized = false;
+    app.telemetryHudUserMoved = false;
     app.mesh = Mesh{};
     app.meshStlBytes.clear();
     app.renderer.UploadMesh(Mesh{});  // clears what's actually drawn — HasMesh() depends on its own indexCount_,
@@ -3959,23 +3965,62 @@ void DrawFusionRibbon(AppState& app, bool busy) {
     ImGui::PopStyleVar(3);
 }
 
-// Live Telemetry & Aerodynamics HUD — seeded on the right side of the
-// viewport on first use, then freely draggable, collapsible (top-right),
-// and closable (top-left).
+// Live Telemetry & Aerodynamics HUD — initially centered horizontally near the
+// bottom of the main window, staying centered and moving relative to the bottom
+// edge during main-window resizing (and remaining freely draggable, collapsible,
+// and closable).
 void DrawTelemetryHud(AppState& app, float topInset) {
     if (!app.showTelemetryHud || !app.meshLoaded) return;
 
+    constexpr float kBottomMargin = 16.0f;
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(
-        ImVec2(std::max(16.0f, viewport->Pos.x + viewport->Size.x - 310.0f), viewport->Pos.y + topInset + 270.0f),
-        ImGuiCond_FirstUseEver);
+    if (!app.telemetryHudInitialized) {
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f, viewport->Pos.y + viewport->Size.y - kBottomMargin),
+            ImGuiCond_Appearing, ImVec2(0.5f, 1.0f));
+    }
     ImGui::SetNextWindowBgAlpha(app.uiThemeIndex == 2 ? 0.98f : 0.84f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, app.uiThemeIndex == 2 ? 0.0f : 6.0f);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing;
 
-    if (ImGui::Begin("Telemetry & Aerodynamics", &app.showTelemetryHud, flags)) {
+    bool expanded = ImGui::Begin("Telemetry & Aerodynamics", &app.showTelemetryHud, flags);
+    {
+        ImVec2 currentPos = ImGui::GetWindowPos();
+        ImVec2 currentSize = ImGui::GetWindowSize();
+        bool collapsed = ImGui::IsWindowCollapsed();
+
+        if (!app.telemetryHudInitialized) {
+            app.telemetryHudInitialized = true;
+            app.telemetryHudUserMoved = false;
+            app.telemetryHudLastViewportSize = viewport->Size;
+        } else {
+            bool posChanged =
+                (currentPos.x != app.telemetryHudLastPos.x || currentPos.y != app.telemetryHudLastPos.y);
+            if (posChanged && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                app.telemetryHudUserMoved = true;
+            }
+        }
+
+        float deltaViewportY = viewport->Size.y - app.telemetryHudLastViewportSize.y;
+        if (!app.telemetryHudUserMoved) {
+            ImVec2 targetPos;
+            targetPos.x = std::floor(viewport->Pos.x + (viewport->Size.x - currentSize.x) * 0.5f);
+            targetPos.y = collapsed ? (currentPos.y + deltaViewportY)
+                                    : (viewport->Pos.y + viewport->Size.y - currentSize.y - kBottomMargin);
+            if (targetPos.x != currentPos.x || targetPos.y != currentPos.y) {
+                ImGui::SetWindowPos(targetPos);
+            }
+        } else if (deltaViewportY != 0.0f) {
+            ImGui::SetWindowPos(ImVec2(currentPos.x, currentPos.y + deltaViewportY));
+        }
+
         ClampWindowToViewport(topInset);
+        app.telemetryHudLastPos = ImGui::GetWindowPos();
+        app.telemetryHudLastViewportSize = viewport->Size;
+    }
+
+    if (expanded) {
         ImGui::TextDisabled("%s", app.statusMessage.c_str());
 
         if (app.voxelGridValid) {
@@ -5880,12 +5925,25 @@ int main(int, char**) {
     }
     ConfigureMacOSAboutMenu();
 
+    int initialWidth = 1920;
+    int initialHeight = 1080;
+    SDL_DisplayID primaryDisplay = SDL_GetPrimaryDisplay();
+    SDL_Rect usableBounds{};
+    if (primaryDisplay != 0 &&
+        (SDL_GetDisplayUsableBounds(primaryDisplay, &usableBounds) ||
+         SDL_GetDisplayBounds(primaryDisplay, &usableBounds)) &&
+        usableBounds.w > 0 && usableBounds.h > 0) {
+        initialWidth = std::min(initialWidth, usableBounds.w);
+        initialHeight = std::min(initialHeight, usableBounds.h);
+    }
+
     SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    SDL_Window* window = SDL_CreateWindow("FlowCraft", 1280, 800, windowFlags);
+    SDL_Window* window = SDL_CreateWindow("FlowCraft", initialWidth, initialHeight, windowFlags);
     if (!window) {
         SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
         return 1;
     }
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
     SDL_GPUDevice* gpuDevice = SDL_CreateGPUDevice(kEmbeddedShaderFormats | SDL_GPU_SHADERFORMAT_METALLIB, true, nullptr);
     if (!gpuDevice) {
