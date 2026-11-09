@@ -201,4 +201,25 @@ AerodynamicForces ComputeAerodynamicForces(const VoxelGrid& grid, const std::vec
 // 3D form of the airframe reads clearly alongside the stress colors.
 OverlayMesh BuildStressMapMesh(const VoxelGrid& grid, const std::vector<float>& field, float stressLo, float stressHi);
 
+// Builds a 3D Iso-surface extraction via parallel Marching Cubes over the
+// fluid velocity or pressure field. Generates a smooth 3D surface mesh
+// shaded with directional + hemispherical lighting where the field crosses
+// `isoValue`. `encloseGreater` determines whether the surface encloses values
+// >= isoValue (e.g. high-speed jets, stagnation zones) or values <= isoValue
+// (e.g. low-speed aerodynamic wake bubbles, suction vortex cores).
+OverlayMesh BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::vector<float>& field, FieldColorMode mode,
+                                float isoValue, float lo, float hi, float alpha = 0.90f,
+                                bool encloseGreater = false, int stride = 1,
+                                const std::vector<float>* xMeans = nullptr);
+
+// Builds a 3D view-aligned volumetric raymarching mesh through the fluid volume.
+// Slices the domain bounding box with N view-perpendicular planes ordered from
+// back to front, continuously sampling the field with trilinear interpolation
+// and mapping through a Beer-Lambert emission-absorption volume transfer function.
+OverlayMesh BuildRaymarchMesh(const VoxelGrid& grid, const std::vector<float>& field, FieldColorMode mode,
+                              float lo, float hi, const Vec3& camPos, const Vec3& camForward,
+                              const Vec3& camRight, const Vec3& camUp, int sliceCount = 64,
+                              float densityScale = 1.2f, float cutoff = 0.08f, float gamma = 1.4f,
+                              const std::vector<float>* xMeans = nullptr);
+
 }  // namespace FieldOverlay

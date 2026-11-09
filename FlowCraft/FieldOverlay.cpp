@@ -1,4 +1,5 @@
 #include "FieldOverlay.h"
+#include "MarchingCubesTables.h"
 
 #include <algorithm>
 #include <cmath>
@@ -766,6 +767,348 @@ OverlayMesh FieldOverlay::BuildStressMapMesh(const VoxelGrid& grid, const std::v
                         local.indices.push_back(base + 0);
                         local.indices.push_back(base + 2);
                         local.indices.push_back(base + 3);
+                    }
+                }
+            }
+        }
+    });
+
+    for (const OverlayMesh& local : partials) {
+        AppendMesh(mesh, local);
+    }
+    return mesh;
+}
+
+OverlayMesh FieldOverlay::BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::vector<float>& field,
+                                                FieldColorMode mode, float isoValue, float lo, float hi,
+                                                float alpha, bool encloseGreater, int stride,
+                                                const std::vector<float>* xMeans) {
+    OverlayMesh mesh;
+    if (field.size() != grid.CellCount() * 4 || grid.nx < 2 || grid.ny < 2 || grid.nz < 2) return mesh;
+    stride = std::max(1, stride);
+
+    float invRange = 1.0f / std::max(hi - lo, 1e-6f);
+    float tColor = std::clamp((isoValue - lo) * invRange, 0.0f, 1.0f);
+    Vec3 baseColor = Colormap(tColor);
+    const Vec3 kLightDir = Normalize(Vec3{0.45f, -0.55f, 0.70f});
+
+    auto sampleVal = [&](int x, int y, int z) -> float {
+        x = std::clamp(x, 0, grid.nx - 1);
+        y = std::clamp(y, 0, grid.ny - 1);
+        z = std::clamp(z, 0, grid.nz - 1);
+        size_t c = grid.Index(x, y, z);
+        if (grid.solid[c]) {
+            return encloseGreater ? -1e30f : 1e30f;
+        }
+        float v = FieldValueMaybeDetrended(field, c, x, mode, xMeans);
+        if (!std::isfinite(v)) {
+            return encloseGreater ? -1e30f : 1e30f;
+        }
+        return v;
+    };
+
+    auto gradWorld = [&](int x, int y, int z) -> Vec3 {
+        float gx = (sampleVal(x + stride, y, z) - sampleVal(x - stride, y, z)) * 0.5f;
+        float gy = (sampleVal(x, y + stride, z) - sampleVal(x, y - stride, z)) * 0.5f;
+        float gz = (sampleVal(x, y, z + stride) - sampleVal(x, y, z - stride)) * 0.5f;
+        // Swap grid-x (world-Y) and grid-y (world-X)
+        return Vec3{gy, gx, gz};
+    };
+
+    unsigned int numThreads = ParallelForZThreadCount(grid.nz - 1);
+    std::vector<OverlayMesh> partials(numThreads);
+
+    ParallelForZ(grid.nz - 1, [&](int zBegin, int zEnd, unsigned int threadIndex) {
+        OverlayMesh& local = partials[threadIndex];
+        int zStartAligned = (zBegin / stride) * stride;
+        for (int z = zStartAligned; z < zEnd; z += stride) {
+            if (z < zBegin) continue;
+            int zNext = std::min(z + stride, grid.nz - 1);
+            if (zNext == z) continue;
+
+            for (int y = 0; y + 1 < grid.ny; y += stride) {
+                int yNext = std::min(y + stride, grid.ny - 1);
+                for (int x = 0; x + 1 < grid.nx; x += stride) {
+                    int xNext = std::min(x + stride, grid.nx - 1);
+
+                    int cx[8] = {x, xNext, xNext, x, x, xNext, xNext, x};
+                    int cy[8] = {y, y, yNext, yNext, y, y, yNext, yNext};
+                    int cz[8] = {z, z, z, z, zNext, zNext, zNext, zNext};
+
+                    float val[8];
+                    int cubeIndex = 0;
+                    for (int k = 0; k < 8; ++k) {
+                        val[k] = sampleVal(cx[k], cy[k], cz[k]);
+                        bool inside = encloseGreater ? (val[k] >= isoValue) : (val[k] <= isoValue);
+                        if (inside) cubeIndex |= (1 << k);
+                    }
+
+                    int edgeMask = MarchingCubes::kEdgeTable[cubeIndex];
+                    if (edgeMask == 0) continue;
+
+                    OverlayVertex edgeVerts[12];
+                    for (int e = 0; e < 12; ++e) {
+                        if (!(edgeMask & (1 << e))) continue;
+                        int c0 = MarchingCubes::kEdgeCorners[e][0];
+                        int c1 = MarchingCubes::kEdgeCorners[e][1];
+                        float v0 = val[c0];
+                        float v1 = val[c1];
+                        float denom = v1 - v0;
+                        float t = (std::fabs(denom) > 1e-12f) ? std::clamp((isoValue - v0) / denom, 0.0f, 1.0f) : 0.5f;
+
+                        Vec3 p0 = grid.CellCenter(cx[c0], cy[c0], cz[c0]);
+                        Vec3 p1 = grid.CellCenter(cx[c1], cy[c1], cz[c1]);
+                        Vec3 pos = p0 + (p1 - p0) * t;
+
+                        Vec3 g0 = gradWorld(cx[c0], cy[c0], cz[c0]);
+                        Vec3 g1 = gradWorld(cx[c1], cy[c1], cz[c1]);
+                        Vec3 grad = g0 + (g1 - g0) * t;
+                        float glen = Length(grad);
+                        Vec3 normal = (glen > 1e-5f) ? (grad * (1.0f / glen)) : Vec3{0.0f, 0.0f, 1.0f};
+                        if (!encloseGreater) normal = normal * -1.0f;
+
+                        float ndotl = std::fabs(Dot(normal, kLightDir));
+                        float hemi = 0.5f + 0.5f * std::fabs(normal.z);
+                        float shade = 0.62f + 0.28f * ndotl + 0.10f * hemi;
+                        edgeVerts[e] = {pos, baseColor * shade, alpha};
+                    }
+
+                    for (int i = 0; MarchingCubes::kTriTable[cubeIndex][i] != -1; i += 3) {
+                        int e0 = MarchingCubes::kTriTable[cubeIndex][i + 0];
+                        int e1 = MarchingCubes::kTriTable[cubeIndex][i + 1];
+                        int e2 = MarchingCubes::kTriTable[cubeIndex][i + 2];
+                        uint32_t base = static_cast<uint32_t>(local.vertices.size());
+                        local.vertices.push_back(edgeVerts[e0]);
+                        local.vertices.push_back(edgeVerts[e1]);
+                        local.vertices.push_back(edgeVerts[e2]);
+                        local.indices.push_back(base + 0);
+                        local.indices.push_back(base + 1);
+                        local.indices.push_back(base + 2);
+                    }
+                }
+            }
+        }
+    });
+
+    for (const OverlayMesh& local : partials) {
+        AppendMesh(mesh, local);
+    }
+    return mesh;
+}
+
+OverlayMesh FieldOverlay::BuildRaymarchMesh(const VoxelGrid& grid, const std::vector<float>& field,
+                                            FieldColorMode mode, float lo, float hi,
+                                            const Vec3& camPos, const Vec3& camForward,
+                                            const Vec3& camRight, const Vec3& camUp,
+                                            int sliceCount, float densityScale, float cutoff,
+                                            float gamma, const std::vector<float>* xMeans) {
+    OverlayMesh mesh;
+    if (field.size() != grid.CellCount() * 4 || grid.nx < 2 || grid.ny < 2 || grid.nz < 2) return mesh;
+
+    Vec3 minBox = grid.CellMinCorner(0, 0, 0);
+    Vec3 maxBox = minBox + Vec3{static_cast<float>(grid.ny) * grid.cellSize,
+                                static_cast<float>(grid.nx) * grid.cellSize,
+                                static_cast<float>(grid.nz) * grid.cellSize};
+
+    static const int kBoxCorners[8][3] = {
+        {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
+        {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}
+    };
+    Vec3 corners[8];
+    for (int i = 0; i < 8; ++i) {
+        corners[i] = Vec3{
+            kBoxCorners[i][0] ? maxBox.x : minBox.x,
+            kBoxCorners[i][1] ? maxBox.y : minBox.y,
+            kBoxCorners[i][2] ? maxBox.z : minBox.z
+        };
+    }
+
+    static const int kBoxEdges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}
+    };
+
+    Vec3 fwd = Normalize(camForward);
+    Vec3 right = Normalize(camRight);
+    Vec3 up = Normalize(camUp);
+
+    float dMin = 1e30f;
+    float dMax = -1e30f;
+    for (int i = 0; i < 8; ++i) {
+        float d = Dot(corners[i] - camPos, fwd);
+        dMin = std::min(dMin, d);
+        dMax = std::max(dMax, d);
+    }
+    if (dMax <= dMin + 1e-4f) return mesh;
+    dMin = std::max(dMin, 0.05f);
+    if (dMax <= dMin + 1e-4f) return mesh;
+
+    sliceCount = std::clamp(sliceCount, 8, 192);
+    float sliceThickness = (dMax - dMin) / static_cast<float>(sliceCount);
+    float invRange = 1.0f / std::max(hi - lo, 1e-6f);
+
+    auto sampleContinuous = [&](const Vec3& p, float& outVal, float& outSolid) -> bool {
+        float gx = (p.y - minBox.y) / grid.cellSize - 0.5f;
+        float gy = (p.x - minBox.x) / grid.cellSize - 0.5f;
+        float gz = (p.z - minBox.z) / grid.cellSize - 0.5f;
+
+        int x0 = static_cast<int>(std::floor(gx));
+        int y0 = static_cast<int>(std::floor(gy));
+        int z0 = static_cast<int>(std::floor(gz));
+        if (x0 < 0 || x0 >= grid.nx - 1 || y0 < 0 || y0 >= grid.ny - 1 || z0 < 0 || z0 >= grid.nz - 1) {
+            outVal = 0.0f;
+            outSolid = 0.0f;
+            return false;
+        }
+        float fx = gx - static_cast<float>(x0);
+        float fy = gy - static_cast<float>(y0);
+        float fz = gz - static_cast<float>(z0);
+
+        float valSum = 0.0f;
+        float solidSum = 0.0f;
+        for (int dz = 0; dz <= 1; ++dz) {
+            float wz = dz ? fz : (1.0f - fz);
+            for (int dy = 0; dy <= 1; ++dy) {
+                float wy = dy ? fy : (1.0f - fy);
+                for (int dx = 0; dx <= 1; ++dx) {
+                    float wx = dx ? fx : (1.0f - fx);
+                    float w = wx * wy * wz;
+                    size_t c = grid.Index(x0 + dx, y0 + dy, z0 + dz);
+                    if (grid.solid[c]) {
+                        solidSum += w;
+                    } else {
+                        float v = FieldValueMaybeDetrended(field, c, x0 + dx, mode, xMeans);
+                        if (std::isfinite(v)) {
+                            valSum += w * v;
+                        }
+                    }
+                }
+            }
+        }
+        outVal = valSum;
+        outSolid = solidSum;
+        return true;
+    };
+
+    auto evalTransfer = [&](const Vec3& p) -> OverlayVertex {
+        OverlayVertex vert{};
+        vert.pos = p;
+        float val = 0.0f, solid = 0.0f;
+        if (!sampleContinuous(p, val, solid) || solid > 0.45f) {
+            vert.color = Vec3{0.0f, 0.0f, 0.0f};
+            vert.alpha = 0.0f;
+            return vert;
+        }
+        float t = std::clamp((val - lo) * invRange, 0.0f, 1.0f);
+        if (t < cutoff) {
+            vert.color = Colormap(t);
+            vert.alpha = 0.0f;
+            return vert;
+        }
+        float tEff = (t - cutoff) / std::max(1.0f - cutoff, 1e-4f);
+        float density = std::pow(tEff, gamma);
+        float alpha = 1.0f - std::exp(-densityScale * density * sliceThickness * 20.0f);
+        alpha = std::clamp(alpha, 0.0f, 0.85f);
+        vert.color = Colormap(t);
+        vert.alpha = alpha;
+        return vert;
+    };
+
+    unsigned int numThreads = ParallelForZThreadCount(sliceCount);
+    std::vector<OverlayMesh> partials(numThreads);
+
+    ParallelForZ(sliceCount, [&](int sBegin, int sEnd, unsigned int threadIndex) {
+        OverlayMesh& local = partials[threadIndex];
+        struct IntersectPt {
+            Vec3 pos;
+            float angle = 0.0f;
+        };
+
+        for (int s = sBegin; s < sEnd; ++s) {
+            // Slices ordered from back (dMax) to front (dMin)
+            float d_s = dMax - (static_cast<float>(s) + 0.5f) * sliceThickness;
+
+            std::vector<IntersectPt> poly;
+            poly.reserve(6);
+            for (int e = 0; e < 12; ++e) {
+                Vec3 pA = corners[kBoxEdges[e][0]];
+                Vec3 pB = corners[kBoxEdges[e][1]];
+                float distA = Dot(pA - camPos, fwd) - d_s;
+                float distB = Dot(pB - camPos, fwd) - d_s;
+                if ((distA > 0.0f) != (distB > 0.0f)) {
+                    float t = distA / (distA - distB);
+                    poly.push_back({pA + (pB - pA) * t, 0.0f});
+                }
+            }
+            if (poly.size() < 3) continue;
+
+            Vec3 centroid{0.0f, 0.0f, 0.0f};
+            for (const auto& pt : poly) centroid = centroid + pt.pos;
+            centroid = centroid * (1.0f / static_cast<float>(poly.size()));
+
+            for (auto& pt : poly) {
+                Vec3 diff = pt.pos - centroid;
+                float u = Dot(diff, right);
+                float v = Dot(diff, up);
+                pt.angle = std::atan2(v, u);
+            }
+            std::sort(poly.begin(), poly.end(), [](const IntersectPt& a, const IntersectPt& b) {
+                return a.angle < b.angle;
+            });
+
+            constexpr int kSubdiv = 5;
+            int polyCount = static_cast<int>(poly.size());
+            for (int i = 0; i < polyCount; ++i) {
+                int next = (i + 1) % polyCount;
+                const Vec3& p0 = centroid;
+                const Vec3& p1 = poly[i].pos;
+                const Vec3& p2 = poly[next].pos;
+
+                OverlayVertex triVerts[(kSubdiv + 1) * (kSubdiv + 2) / 2];
+                int idx = 0;
+                for (int r = 0; r <= kSubdiv; ++r) {
+                    for (int c = 0; c <= r; ++c) {
+                        float w0 = 1.0f - static_cast<float>(r) / static_cast<float>(kSubdiv);
+                        float w1 = static_cast<float>(r - c) / static_cast<float>(kSubdiv);
+                        float w2 = static_cast<float>(c) / static_cast<float>(kSubdiv);
+                        Vec3 pt = p0 * w0 + p1 * w1 + p2 * w2;
+                        triVerts[idx++] = evalTransfer(pt);
+                    }
+                }
+
+                auto vertIndex = [&](int r, int c) -> int {
+                    return r * (r + 1) / 2 + c;
+                };
+
+                for (int r = 0; r < kSubdiv; ++r) {
+                    for (int c = 0; c <= r; ++c) {
+                        int v0 = vertIndex(r, c);
+                        int v1 = vertIndex(r + 1, c);
+                        int v2 = vertIndex(r + 1, c + 1);
+
+                        if (triVerts[v0].alpha > 0.0f || triVerts[v1].alpha > 0.0f || triVerts[v2].alpha > 0.0f) {
+                            uint32_t base = static_cast<uint32_t>(local.vertices.size());
+                            local.vertices.push_back(triVerts[v0]);
+                            local.vertices.push_back(triVerts[v1]);
+                            local.vertices.push_back(triVerts[v2]);
+                            local.indices.push_back(base + 0);
+                            local.indices.push_back(base + 1);
+                            local.indices.push_back(base + 2);
+                        }
+
+                        if (c < r) {
+                            int v3 = vertIndex(r, c + 1);
+                            if (triVerts[v0].alpha > 0.0f || triVerts[v2].alpha > 0.0f || triVerts[v3].alpha > 0.0f) {
+                                uint32_t base = static_cast<uint32_t>(local.vertices.size());
+                                local.vertices.push_back(triVerts[v0]);
+                                local.vertices.push_back(triVerts[v2]);
+                                local.vertices.push_back(triVerts[v3]);
+                                local.indices.push_back(base + 0);
+                                local.indices.push_back(base + 1);
+                                local.indices.push_back(base + 2);
+                            }
+                        }
                     }
                 }
             }
