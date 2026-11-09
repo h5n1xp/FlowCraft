@@ -732,6 +732,10 @@ struct AppState {
     ImVec2 telemetryHudLastPos{0.0f, 0.0f};
     ImVec2 telemetryHudLastViewportSize{0.0f, 0.0f};
     bool showProcessingWindow = true;
+    bool processingWindowInitialized = false;
+    bool processingWindowUserMoved = false;
+    ImVec2 processingWindowLastPos{0.0f, 0.0f};
+    ImVec2 processingWindowLastViewportSize{0.0f, 0.0f};
     bool classicSinglePanelUI = false;
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
     // 2 = Amiga (AmigaOS 1.3 window borders, gadgets, Topaz font, and 4-color palette).
@@ -2625,6 +2629,8 @@ void ResetSession(AppState& app) {
     app.meshLoaded = false;
     app.telemetryHudInitialized = false;
     app.telemetryHudUserMoved = false;
+    app.processingWindowInitialized = false;
+    app.processingWindowUserMoved = false;
     app.mesh = Mesh{};
     app.meshStlBytes.clear();
     app.renderer.UploadMesh(Mesh{});  // clears what's actually drawn — HasMesh() depends on its own indexCount_,
@@ -3227,19 +3233,56 @@ void DrawBusyOverlay(const AppState& app) {
 // not "the solver running" itself, and DrawBusyOverlay's centered panel
 // already covers those adequately on its own — this window has nothing
 // to show for them.
+// Solver progress & substep batch monitor — seeded in the top-right corner
+// below DrawOrientationGizmo, keeping its position relative to the right edge
+// when the main window is resized (while remaining freely draggable,
+// collapsible, and closable).
 void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
     if (!app.lbmRunning.load(std::memory_order_relaxed) || !app.showProcessingWindow) return;
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // Seeded in the top-right corner below DrawOrientationGizmo on first use,
-    // then freely draggable, collapsible (top-right), and closable (top-left).
-    ImGui::SetNextWindowPos(
-        ImVec2(std::max(16.0f, viewport->Pos.x + viewport->Size.x - 260.0f), viewport->Pos.y + topInset + 140.0f),
-        ImGuiCond_FirstUseEver);
+    constexpr float kRightMargin = 20.0f;
+    if (!app.processingWindowInitialized) {
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->Pos.x + viewport->Size.x - kRightMargin, viewport->Pos.y + topInset + 140.0f),
+            ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
+    }
     ImGui::SetNextWindowBgAlpha(0.85f);
-    if (ImGui::Begin("Processing", &app.showProcessingWindow, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ClampWindowToViewport(topInset);
+    bool expanded = ImGui::Begin("Processing", &app.showProcessingWindow, ImGuiWindowFlags_AlwaysAutoResize);
+    {
+        ImVec2 currentPos = ImGui::GetWindowPos();
+        ImVec2 currentSize = ImGui::GetWindowSize();
 
+        if (!app.processingWindowInitialized) {
+            app.processingWindowInitialized = true;
+            app.processingWindowUserMoved = false;
+            app.processingWindowLastViewportSize = viewport->Size;
+        } else {
+            bool posChanged =
+                (currentPos.x != app.processingWindowLastPos.x || currentPos.y != app.processingWindowLastPos.y);
+            if (posChanged && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                app.processingWindowUserMoved = true;
+            }
+        }
+
+        float deltaViewportX = viewport->Size.x - app.processingWindowLastViewportSize.x;
+        if (!app.processingWindowUserMoved) {
+            ImVec2 targetPos;
+            targetPos.x = std::max(16.0f, viewport->Pos.x + viewport->Size.x - currentSize.x - kRightMargin);
+            targetPos.y = currentPos.y;
+            if (targetPos.x != currentPos.x) {
+                ImGui::SetWindowPos(targetPos);
+            }
+        } else if (deltaViewportX != 0.0f) {
+            ImGui::SetWindowPos(ImVec2(currentPos.x + deltaViewportX, currentPos.y));
+        }
+
+        ClampWindowToViewport(topInset);
+        app.processingWindowLastPos = ImGui::GetWindowPos();
+        app.processingWindowLastViewportSize = viewport->Size;
+    }
+
+    if (expanded) {
         ImGui::TextUnformatted("Solver running...");
         ImGui::Text("Step %d", app.lbmStepCount.load(std::memory_order_relaxed));
 
@@ -4222,6 +4265,7 @@ void DrawFusionInspector(AppState& app, bool busy) {
             ImGui::Checkbox("Invert X", &app.camera.invertX);
             ImGui::SameLine();
             ImGui::Checkbox("Invert Y", &app.camera.invertY);
+            ImGui::Checkbox("Invert Scroll Zoom", &app.camera.invertScrollZoom);
         } else if (app.activeTab == WorkspaceTab::Voxelize) {
             ImGui::BeginDisabled(busy);
             ImGui::SetNextItemWidth(140);
@@ -4768,6 +4812,7 @@ void DrawUI(AppState& app) {
         ImGui::Checkbox("Invert X", &app.camera.invertX);
         ImGui::SameLine();
         ImGui::Checkbox("Invert Y", &app.camera.invertY);
+        ImGui::Checkbox("Invert Scroll Zoom", &app.camera.invertScrollZoom);
 
         ImGui::Separator();
         ImGui::TextUnformatted("Display");
