@@ -78,5 +78,6 @@ std::optional<std::string> SaveSessionFileDialog(const std::string& defaultName)
 // There is no application menu to configure outside macOS; the app version
 // is still exposed through SDL_SetAppMetadata (see main()).
 void ConfigureMacOSAboutMenu() {}
+void ConfigureMacOSAppIcon() {}
 
 #endif  // !__APPLE__

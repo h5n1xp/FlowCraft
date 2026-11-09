@@ -31,6 +31,7 @@
 #include "Camera.h"
 #include "FieldOverlay.h"
 #include "FileDialog.h"
+#include "FlowCraftIcon.h"
 #include "GpuShaders.h"
 #include "LatticeModel.h"
 #include "LbmReference.h"
@@ -6243,6 +6244,7 @@ int main(int, char**) {
         return 1;
     }
     ConfigureMacOSAboutMenu();
+    ConfigureMacOSAppIcon();
 
     int initialWidth = 1920;
     int initialHeight = 1080;
@@ -6263,6 +6265,15 @@ int main(int, char**) {
         return 1;
     }
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+
+    SDL_Surface* iconSurface = SDL_CreateSurfaceFrom(kFlowCraftIconWidth, kFlowCraftIconHeight,
+                                                     SDL_PIXELFORMAT_RGBA32,
+                                                     const_cast<uint8_t*>(GetFlowCraftIconRgba()),
+                                                     kFlowCraftIconWidth * 4);
+    if (iconSurface) {
+        SDL_SetWindowIcon(window, iconSurface);
+        SDL_DestroySurface(iconSurface);
+    }
 
     SDL_GPUDevice* gpuDevice = SDL_CreateGPUDevice(kEmbeddedShaderFormats | SDL_GPU_SHADERFORMAT_METALLIB, true, nullptr);
     if (!gpuDevice) {

@@ -17,3 +17,6 @@ std::optional<std::string> SaveSessionFileDialog(const std::string& defaultName)
 // Configures the native macOS application menu's "About FlowCraft" item
 // and panel to display "FlowCraft v0.1 by Matt Parsons".
 void ConfigureMacOSAboutMenu();
+
+// Configures the native macOS application Dock and App Switcher icon.
+void ConfigureMacOSAppIcon();

@@ -10,6 +10,7 @@ DerivedData/
 build/
 cmake-build-*/
 out/
+*.app/
 
 # ImGui window layout (per-user runtime state)
 imgui.ini

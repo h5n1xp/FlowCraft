@@ -1,4 +1,5 @@
 #include "FileDialog.h"
+#include "FlowCraftIcon.h"
 
 #import <AppKit/AppKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -107,4 +108,60 @@ void ConfigureMacOSAboutMenu() {
     aboutItem.title = @"About FlowCraft";
     aboutItem.target = aboutTarget;
     aboutItem.action = @selector(showAboutPanel:);
+}
+
+void ConfigureMacOSAppIcon() {
+    @autoreleasepool {
+        NSImage* iconImage = nil;
+
+        // 1. Try loading FlowCraft.icns from application bundle resources
+        NSString* icnsPath = [[NSBundle mainBundle] pathForResource:@"FlowCraft" ofType:@"icns"];
+        if (icnsPath && [[NSFileManager defaultManager] fileExistsAtPath:icnsPath]) {
+            iconImage = [[NSImage alloc] initWithContentsOfFile:icnsPath];
+        }
+
+        // 2. Try loading from adjacent or local FlowCraft/Assets/FlowCraft.icns
+        if (!iconImage) {
+            NSString* execPath = [[NSBundle mainBundle] executablePath];
+            if (execPath) {
+                NSString* execDir = [execPath stringByDeletingLastPathComponent];
+                NSArray<NSString*>* searchCandidates = @[
+                    [execDir stringByAppendingPathComponent:@"FlowCraft.icns"],
+                    [execDir stringByAppendingPathComponent:@"FlowCraft/Assets/FlowCraft.icns"],
+                    [execDir stringByAppendingPathComponent:@"Assets/FlowCraft.icns"]
+                ];
+                for (NSString* candidate in searchCandidates) {
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+                        iconImage = [[NSImage alloc] initWithContentsOfFile:candidate];
+                        if (iconImage) break;
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback to embedded high-resolution 128x128 RGBA icon bitmap
+        if (!iconImage) {
+            NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
+                initWithBitmapDataPlanes:NULL
+                              pixelsWide:kFlowCraftIconWidth
+                              pixelsHigh:kFlowCraftIconHeight
+                           bitsPerSample:8
+                         samplesPerPixel:4
+                                hasAlpha:YES
+                                isPlanar:NO
+                          colorSpaceName:NSDeviceRGBColorSpace
+                            bitmapFormat:0
+                             bytesPerRow:kFlowCraftIconWidth * 4
+                            bitsPerPixel:32];
+            if (rep) {
+                std::memcpy([rep bitmapData], GetFlowCraftIconRgba(), kFlowCraftIconWidth * kFlowCraftIconHeight * 4);
+                iconImage = [[NSImage alloc] initWithSize:NSMakeSize(kFlowCraftIconWidth, kFlowCraftIconHeight)];
+                [iconImage addRepresentation:rep];
+            }
+        }
+
+        if (iconImage) {
+            [NSApp setApplicationIconImage:iconImage];
+        }
+    }
 }
