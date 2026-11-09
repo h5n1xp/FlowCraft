@@ -197,7 +197,7 @@ inline SolverBackend CombineSolverBackend(int typeIndex, int deviceIndex) {
 // lastField/cachedRange*). Particles is simulated/meshed fresh every
 // rendered frame rather than on demand like the other two — see
 // UpdateSmokeTrailAndUpload's comment.
-enum class OverlayStyle { Slice, VoxelCloud, Particles, StressMap, IsoSurface };
+enum class OverlayStyle { Slice, VoxelCloud, Particles, StressMap, IsoSurface, Raymarch };
 
 // Active stage tab in the Autodesk Fusion-style top ribbon bar.
 enum class WorkspaceTab { Model, Voxelize, Simulate, Inspect };
@@ -512,6 +512,17 @@ struct AppState {
     std::atomic<float> isoAlphaAtomic{0.90f};
     std::atomic<bool> isoEncloseGreaterAtomic{false};
     std::atomic<int> isoStrideAtomic{1};
+
+    // 3D Volumetric Raymarching via view-aligned slicing (FieldOverlay::BuildRaymarchMesh)
+    int raymarchSliceCount = 64;      // Number of view-aligned sample planes (32..128)
+    float raymarchDensity = 1.2f;     // Optical absorption / emission density scale
+    float raymarchCutoff = 0.08f;     // Low-end cutoff threshold to keep ambient fluid crystal clear
+    float raymarchGamma = 1.4f;       // Contrast exponent for volume density mapping
+    std::atomic<int> raymarchSliceCountAtomic{64};
+    std::atomic<float> raymarchDensityAtomic{1.2f};
+    std::atomic<float> raymarchCutoffAtomic{0.08f};
+    std::atomic<float> raymarchGammaAtomic{1.4f};
+    std::atomic<float> cameraPosXAtomic{0.0f}, cameraPosYAtomic{0.0f}, cameraPosZAtomic{0.0f};
 
     // Atomic mirrors of the UI-bound fields above that
     // BuildOverlayMeshFromField reads, refreshed once per frame (same
@@ -1593,6 +1604,26 @@ OverlayMesh BuildMeshForStyle(const AppState& app, const std::vector<float>& fie
         const std::vector<float>* xMeans = mode == FieldColorMode::Pressure ? pressureXMeans : nullptr;
         return FieldOverlay::BuildIsoSurfaceMesh(app.voxelGrid, field, mode, isoVal, lo, hi,
                                                 alpha, encloseGreater, stride, xMeans);
+    }
+    if (style == OverlayStyle::Raymarch) {
+        float lo = mode == FieldColorMode::Speed ? speedLo : pressureLo;
+        float hi = mode == FieldColorMode::Speed ? speedHi : pressureHi;
+        Vec3 camForward{app.cameraForwardXAtomic.load(std::memory_order_relaxed),
+                         app.cameraForwardYAtomic.load(std::memory_order_relaxed),
+                         app.cameraForwardZAtomic.load(std::memory_order_relaxed)};
+        Vec3 camRight = Normalize(Cross(camForward, Vec3{0.0f, 0.0f, 1.0f}));
+        Vec3 camUp = Cross(camRight, camForward);
+        Vec3 camPos{app.cameraPosXAtomic.load(std::memory_order_relaxed),
+                     app.cameraPosYAtomic.load(std::memory_order_relaxed),
+                     app.cameraPosZAtomic.load(std::memory_order_relaxed)};
+        int sliceCount = app.raymarchSliceCountAtomic.load(std::memory_order_relaxed);
+        float density = app.raymarchDensityAtomic.load(std::memory_order_relaxed);
+        float cutoff = app.raymarchCutoffAtomic.load(std::memory_order_relaxed);
+        float gamma = app.raymarchGammaAtomic.load(std::memory_order_relaxed);
+        const std::vector<float>* xMeans = mode == FieldColorMode::Pressure ? pressureXMeans : nullptr;
+        return FieldOverlay::BuildRaymarchMesh(app.voxelGrid, field, mode, lo, hi,
+                                              camPos, camForward, camRight, camUp,
+                                              sliceCount, density, cutoff, gamma, xMeans);
     }
     if (style == OverlayStyle::VoxelCloud) {
         int stride = FieldOverlay::ChooseVoxelCloudStride(app.voxelGrid, kVoxelCloudTargetCount);
@@ -3366,7 +3397,8 @@ enum class RibbonIcon {
     StyleCloud,
     StyleParticles,
     StyleStress,
-    StyleIso
+    StyleIso,
+    StyleRaymarch
 };
 
 void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIcon icon, ImU32 primaryCol,
@@ -3598,6 +3630,16 @@ void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIco
             dl->AddEllipse(ImVec2(center.x, center.y), ImVec2(r * 0.75f, r * 0.55f), accentCol, 0.0f, 0, 1.8f);
             dl->AddLine(ImVec2(center.x - r * 0.65f, center.y), ImVec2(center.x + r * 0.65f, center.y),
                         IM_COL32(255, 255, 255, 130), 1.2f);
+            break;
+        }
+        case RibbonIcon::StyleRaymarch: {
+            // Stack of view-aligned volumetric ray slices with depth gradient
+            for (int i = -2; i <= 2; ++i) {
+                float y = center.y + static_cast<float>(i) * r * 0.35f;
+                float halfW = r * (0.85f - std::fabs(static_cast<float>(i)) * 0.12f);
+                ImU32 col = (i == 0) ? accentCol : IM_COL32(80, 185, 235, 140 + i * 25);
+                dl->AddLine(ImVec2(center.x - halfW, y), ImVec2(center.x + halfW, y), col, 2.0f);
+            }
             break;
         }
     }
@@ -4010,6 +4052,12 @@ void DrawFusionRibbon(AppState& app, bool busy) {
                              app.overlayStyle == OverlayStyle::IsoSurface && app.viewMode == ViewMode::FlowOverlay,
                              app.lbmValid, "3D Iso-surface extraction (wake bubble / vortex core).", 50.0f)) {
             selectOverlayStyle(OverlayStyle::IsoSurface);
+        }
+        ImGui::SameLine(0.0f, 2.0f);
+        if (RibbonIconButton("##rib_sray", "Raymarch", RibbonIcon::StyleRaymarch,
+                             app.overlayStyle == OverlayStyle::Raymarch && app.viewMode == ViewMode::FlowOverlay,
+                             app.lbmValid, "3D Volumetric raymarching continuous field view.", 60.0f)) {
+            selectOverlayStyle(OverlayStyle::Raymarch);
         }
         ImGui::SameLine(0.0f, 3.0f);
         if (RibbonIconButton("##rib_buildovl", "Update", RibbonIcon::BuildOverlay, false, !busy && app.lbmValid,
@@ -4564,9 +4612,9 @@ void DrawFusionInspector(AppState& app, bool busy) {
                 }
             } else {
                 int styleIndex = static_cast<int>(app.overlayStyle);
-                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface"};
+                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface", "Volumetric Raymarching"};
                 ImGui::SetNextItemWidth(200);
-                if (ImGui::Combo("Style", &styleIndex, styleNames, 5)) {
+                if (ImGui::Combo("Style", &styleIndex, styleNames, 6)) {
                     app.overlayStyle = static_cast<OverlayStyle>(styleIndex);
                     app.overlayStyleAtomic.store(static_cast<int>(app.overlayStyle), std::memory_order_relaxed);
                     StartResliceTask(app);
@@ -4578,6 +4626,45 @@ void DrawFusionInspector(AppState& app, bool busy) {
                     if (ImGui::Checkbox("Remove channel pressure gradient", &app.detrendPressure)) {
                         app.detrendPressureAtomic.store(app.detrendPressure, std::memory_order_relaxed);
                         app.voxelAlphaRangeInitialized = false;
+                        StartResliceTask(app);
+                    }
+                }
+
+                if (app.overlayStyle == OverlayStyle::Raymarch) {
+                    int colorIndex = app.overlayColorMode == FieldColorMode::Speed ? 0 : 1;
+                    const char* colorNames[] = {"Speed", "Pressure"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Volume field", &colorIndex, colorNames, 2)) {
+                        app.overlayColorMode = colorIndex == 0 ? FieldColorMode::Speed : FieldColorMode::Pressure;
+                        app.overlayColorModeAtomic.store(static_cast<int>(app.overlayColorMode), std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Absorption Density", &app.raymarchDensity, 0.10f, 5.0f, "%.2fx")) {
+                        app.raymarchDensityAtomic.store(app.raymarchDensity, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Ambient Cutoff", &app.raymarchCutoff, 0.0f, 0.50f, "%.2f")) {
+                        app.raymarchCutoffAtomic.store(app.raymarchCutoff, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Contrast Gamma", &app.raymarchGamma, 0.5f, 3.0f, "%.2f")) {
+                        app.raymarchGammaAtomic.store(app.raymarchGamma, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    int sliceChoice = (app.raymarchSliceCount <= 32) ? 0 : (app.raymarchSliceCount <= 64 ? 1 : (app.raymarchSliceCount <= 96 ? 2 : 3));
+                    const char* sliceNames[] = {"32 Slices (Fast)", "64 Slices (Balanced)", "96 Slices (Fine)", "128 Slices (Ultra)"};
+                    ImGui::SetNextItemWidth(170);
+                    if (ImGui::Combo("Sampling Quality", &sliceChoice, sliceNames, 4)) {
+                        const int counts[] = {32, 64, 96, 128};
+                        app.raymarchSliceCount = counts[sliceChoice];
+                        app.raymarchSliceCountAtomic.store(app.raymarchSliceCount, std::memory_order_relaxed);
                         StartResliceTask(app);
                     }
                 }
@@ -5631,9 +5718,9 @@ void DrawUI(AppState& app) {
                 ImGui::TextUnformatted("Flow Overlay");
 
                 int styleIndex = static_cast<int>(app.overlayStyle);
-                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface"};
+                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface", "Volumetric Raymarching"};
                 ImGui::SetNextItemWidth(220);
-                if (ImGui::Combo("Style", &styleIndex, styleNames, 5)) {
+                if (ImGui::Combo("Style", &styleIndex, styleNames, 6)) {
                     app.overlayStyle = static_cast<OverlayStyle>(styleIndex);
                     app.overlayStyleAtomic.store(static_cast<int>(app.overlayStyle), std::memory_order_relaxed);
                     StartResliceTask(app);
@@ -5658,7 +5745,9 @@ void DrawUI(AppState& app) {
                         "skin by local aerodynamic stress (Pa).\n"
                         "3D Iso-Surface: parallel Marching Cubes extraction of\n"
                         "smooth 3D boundary surfaces at chosen speed or pressure\n"
-                        "thresholds (e.g. wake bubbles or vortex cores).");
+                        "thresholds (e.g. wake bubbles or vortex cores).\n"
+                        "Volumetric Raymarching: view-aligned continuous volume\n"
+                        "integration through the velocity or pressure field.");
                 }
 
                 if (app.overlayStyle == OverlayStyle::StressMap) {
@@ -5683,6 +5772,45 @@ void DrawUI(AppState& app) {
                             "subtracts each cross-section's own mean pressure\n"
                             "before coloring/fading, removing that gradient so\n"
                             "the local effect is what shows.");
+                    }
+                }
+
+                if (app.overlayStyle == OverlayStyle::Raymarch) {
+                    int colorIndex = app.overlayColorMode == FieldColorMode::Speed ? 0 : 1;
+                    const char* colorNames[] = {"Speed", "Pressure"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Volume field", &colorIndex, colorNames, 2)) {
+                        app.overlayColorMode = colorIndex == 0 ? FieldColorMode::Speed : FieldColorMode::Pressure;
+                        app.overlayColorModeAtomic.store(static_cast<int>(app.overlayColorMode), std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Absorption Density", &app.raymarchDensity, 0.10f, 5.0f, "%.2fx")) {
+                        app.raymarchDensityAtomic.store(app.raymarchDensity, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Ambient Cutoff", &app.raymarchCutoff, 0.0f, 0.50f, "%.2f")) {
+                        app.raymarchCutoffAtomic.store(app.raymarchCutoff, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Contrast Gamma", &app.raymarchGamma, 0.5f, 3.0f, "%.2f")) {
+                        app.raymarchGammaAtomic.store(app.raymarchGamma, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    int sliceChoice = (app.raymarchSliceCount <= 32) ? 0 : (app.raymarchSliceCount <= 64 ? 1 : (app.raymarchSliceCount <= 96 ? 2 : 3));
+                    const char* sliceNames[] = {"32 Slices (Fast)", "64 Slices (Balanced)", "96 Slices (Fine)", "128 Slices (Ultra)"};
+                    ImGui::SetNextItemWidth(170);
+                    if (ImGui::Combo("Sampling Quality", &sliceChoice, sliceNames, 4)) {
+                        const int counts[] = {32, 64, 96, 128};
+                        app.raymarchSliceCount = counts[sliceChoice];
+                        app.raymarchSliceCountAtomic.store(app.raymarchSliceCount, std::memory_order_relaxed);
+                        StartResliceTask(app);
                     }
                 }
 
@@ -6244,12 +6372,18 @@ int main(int, char**) {
                     app.cameraForwardXAtomic.store(forward.x, std::memory_order_relaxed);
                     app.cameraForwardYAtomic.store(forward.y, std::memory_order_relaxed);
                     app.cameraForwardZAtomic.store(forward.z, std::memory_order_relaxed);
-                    if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::VoxelCloud) {
+                    if (app.viewMode == ViewMode::FlowOverlay &&
+                        (app.overlayStyle == OverlayStyle::VoxelCloud || app.overlayStyle == OverlayStyle::Raymarch)) {
                         TryFastReslice(app);
                     }
                 }
-                if (event.type == SDL_EVENT_MOUSE_WHEEL)
+                if (event.type == SDL_EVENT_MOUSE_WHEEL) {
                     app.camera.OnScroll(event.wheel.y);
+                    if (app.viewMode == ViewMode::FlowOverlay &&
+                        (app.overlayStyle == OverlayStyle::VoxelCloud || app.overlayStyle == OverlayStyle::Raymarch)) {
+                        TryFastReslice(app);
+                    }
+                }
             } else {
                 app.draggingCamera = false;
                 app.draggingSliceHandle = false;
@@ -6375,11 +6509,19 @@ int main(int, char**) {
         app.isoAlphaAtomic.store(app.isoAlpha, std::memory_order_relaxed);
         app.isoEncloseGreaterAtomic.store(app.isoEncloseGreater, std::memory_order_relaxed);
         app.isoStrideAtomic.store(app.isoStride, std::memory_order_relaxed);
+        app.raymarchSliceCountAtomic.store(app.raymarchSliceCount, std::memory_order_relaxed);
+        app.raymarchDensityAtomic.store(app.raymarchDensity, std::memory_order_relaxed);
+        app.raymarchCutoffAtomic.store(app.raymarchCutoff, std::memory_order_relaxed);
+        app.raymarchGammaAtomic.store(app.raymarchGamma, std::memory_order_relaxed);
         {
             Vec3 forward = app.camera.GetBasis().forward;
             app.cameraForwardXAtomic.store(forward.x, std::memory_order_relaxed);
             app.cameraForwardYAtomic.store(forward.y, std::memory_order_relaxed);
             app.cameraForwardZAtomic.store(forward.z, std::memory_order_relaxed);
+            Vec3 eye = app.camera.Eye();
+            app.cameraPosXAtomic.store(eye.x, std::memory_order_relaxed);
+            app.cameraPosYAtomic.store(eye.y, std::memory_order_relaxed);
+            app.cameraPosZAtomic.store(eye.z, std::memory_order_relaxed);
         }
 
         SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(gpuDevice);

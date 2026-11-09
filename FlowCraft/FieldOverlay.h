@@ -212,4 +212,14 @@ OverlayMesh BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::vector<float>&
                                 bool encloseGreater = false, int stride = 1,
                                 const std::vector<float>* xMeans = nullptr);
 
+// Builds a 3D view-aligned volumetric raymarching mesh through the fluid volume.
+// Slices the domain bounding box with N view-perpendicular planes ordered from
+// back to front, continuously sampling the field with trilinear interpolation
+// and mapping through a Beer-Lambert emission-absorption volume transfer function.
+OverlayMesh BuildRaymarchMesh(const VoxelGrid& grid, const std::vector<float>& field, FieldColorMode mode,
+                              float lo, float hi, const Vec3& camPos, const Vec3& camForward,
+                              const Vec3& camRight, const Vec3& camUp, int sliceCount = 64,
+                              float densityScale = 1.2f, float cutoff = 0.08f, float gamma = 1.4f,
+                              const std::vector<float>* xMeans = nullptr);
+
 }  // namespace FieldOverlay

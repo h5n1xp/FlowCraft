@@ -8,7 +8,7 @@ My relatively old MacStudio Ultra can run the LBM GPU visualisation for 22 milli
 
 Due to the large RAM and compute resources required for CFD, I'm not sure how useful this really is as a desktop application but it is fun.
 
-Several visualisations are available: 2D cross-section slice planes, 3D semi-transparent voxel cloud, advected dye-injection smoke trails, airframe aerodynamic surface stress maps, and 3D iso-surface boundary extractions (Marching Cubes) for wake bubbles and vortex cores.
+Several visualisations are available: 2D cross-section slice planes, 3D semi-transparent voxel cloud, advected dye-injection smoke trails, airframe aerodynamic surface stress maps, 3D iso-surface boundary extractions (Marching Cubes), and 3D volumetric raymarching (view-aligned continuous emission-absorption volume rendering).
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot2.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot3.jpg" alt="LBM Turbulence" width="500" />
