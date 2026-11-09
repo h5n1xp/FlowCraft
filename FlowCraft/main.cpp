@@ -197,7 +197,7 @@ inline SolverBackend CombineSolverBackend(int typeIndex, int deviceIndex) {
 // lastField/cachedRange*). Particles is simulated/meshed fresh every
 // rendered frame rather than on demand like the other two — see
 // UpdateSmokeTrailAndUpload's comment.
-enum class OverlayStyle { Slice, VoxelCloud, Particles, StressMap };
+enum class OverlayStyle { Slice, VoxelCloud, Particles, StressMap, IsoSurface };
 
 // Active stage tab in the Autodesk Fusion-style top ribbon bar.
 enum class WorkspaceTab { Model, Voxelize, Simulate, Inspect };
@@ -503,6 +503,16 @@ struct AppState {
     // particle field identically, not one plane at a time.
     bool sliceShowParticles = false;
 
+    // 3D Iso-surface extraction via Marching Cubes (FieldOverlay::BuildIsoSurfaceMesh)
+    float isoThreshold = 0.35f;       // Normalized threshold [0..1] within field range
+    float isoAlpha = 0.90f;           // Surface opacity (0.1..1.0)
+    bool isoEncloseGreater = false;   // false = enclose <= iso (wake bubble, vortex core), true = >= iso (jet, stagnation)
+    int isoStride = 1;                // 1 = full resolution, 2 = 2x downsampled stride
+    std::atomic<float> isoThresholdAtomic{0.35f};
+    std::atomic<float> isoAlphaAtomic{0.90f};
+    std::atomic<bool> isoEncloseGreaterAtomic{false};
+    std::atomic<int> isoStrideAtomic{1};
+
     // Atomic mirrors of the UI-bound fields above that
     // BuildOverlayMeshFromField reads, refreshed once per frame (same
     // pattern as lbmSubstepsAtomic etc.) — needed because that function
@@ -732,6 +742,10 @@ struct AppState {
     ImVec2 telemetryHudLastPos{0.0f, 0.0f};
     ImVec2 telemetryHudLastViewportSize{0.0f, 0.0f};
     bool showProcessingWindow = true;
+    bool processingWindowInitialized = false;
+    bool processingWindowUserMoved = false;
+    ImVec2 processingWindowLastPos{0.0f, 0.0f};
+    ImVec2 processingWindowLastViewportSize{0.0f, 0.0f};
     bool classicSinglePanelUI = false;
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
     // 2 = Amiga (AmigaOS 1.3 window borders, gadgets, Topaz font, and 4-color palette).
@@ -1567,6 +1581,18 @@ OverlayMesh BuildMeshForStyle(const AppState& app, const std::vector<float>& fie
     }
     if (style == OverlayStyle::StressMap) {
         return FieldOverlay::BuildStressMapMesh(app.voxelGrid, field, stressLo, stressHi);
+    }
+    if (style == OverlayStyle::IsoSurface) {
+        float lo = mode == FieldColorMode::Speed ? speedLo : pressureLo;
+        float hi = mode == FieldColorMode::Speed ? speedHi : pressureHi;
+        float thresh = app.isoThresholdAtomic.load(std::memory_order_relaxed);
+        float isoVal = lo + thresh * (hi - lo);
+        float alpha = app.isoAlphaAtomic.load(std::memory_order_relaxed);
+        bool encloseGreater = app.isoEncloseGreaterAtomic.load(std::memory_order_relaxed);
+        int stride = app.isoStrideAtomic.load(std::memory_order_relaxed);
+        const std::vector<float>* xMeans = mode == FieldColorMode::Pressure ? pressureXMeans : nullptr;
+        return FieldOverlay::BuildIsoSurfaceMesh(app.voxelGrid, field, mode, isoVal, lo, hi,
+                                                alpha, encloseGreater, stride, xMeans);
     }
     if (style == OverlayStyle::VoxelCloud) {
         int stride = FieldOverlay::ChooseVoxelCloudStride(app.voxelGrid, kVoxelCloudTargetCount);
@@ -2625,6 +2651,8 @@ void ResetSession(AppState& app) {
     app.meshLoaded = false;
     app.telemetryHudInitialized = false;
     app.telemetryHudUserMoved = false;
+    app.processingWindowInitialized = false;
+    app.processingWindowUserMoved = false;
     app.mesh = Mesh{};
     app.meshStlBytes.clear();
     app.renderer.UploadMesh(Mesh{});  // clears what's actually drawn — HasMesh() depends on its own indexCount_,
@@ -3227,19 +3255,56 @@ void DrawBusyOverlay(const AppState& app) {
 // not "the solver running" itself, and DrawBusyOverlay's centered panel
 // already covers those adequately on its own — this window has nothing
 // to show for them.
+// Solver progress & substep batch monitor — seeded in the top-right corner
+// below DrawOrientationGizmo, keeping its position relative to the right edge
+// when the main window is resized (while remaining freely draggable,
+// collapsible, and closable).
 void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
     if (!app.lbmRunning.load(std::memory_order_relaxed) || !app.showProcessingWindow) return;
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // Seeded in the top-right corner below DrawOrientationGizmo on first use,
-    // then freely draggable, collapsible (top-right), and closable (top-left).
-    ImGui::SetNextWindowPos(
-        ImVec2(std::max(16.0f, viewport->Pos.x + viewport->Size.x - 260.0f), viewport->Pos.y + topInset + 140.0f),
-        ImGuiCond_FirstUseEver);
+    constexpr float kRightMargin = 20.0f;
+    if (!app.processingWindowInitialized) {
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->Pos.x + viewport->Size.x - kRightMargin, viewport->Pos.y + topInset + 140.0f),
+            ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
+    }
     ImGui::SetNextWindowBgAlpha(0.85f);
-    if (ImGui::Begin("Processing", &app.showProcessingWindow, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ClampWindowToViewport(topInset);
+    bool expanded = ImGui::Begin("Processing", &app.showProcessingWindow, ImGuiWindowFlags_AlwaysAutoResize);
+    {
+        ImVec2 currentPos = ImGui::GetWindowPos();
+        ImVec2 currentSize = ImGui::GetWindowSize();
 
+        if (!app.processingWindowInitialized) {
+            app.processingWindowInitialized = true;
+            app.processingWindowUserMoved = false;
+            app.processingWindowLastViewportSize = viewport->Size;
+        } else {
+            bool posChanged =
+                (currentPos.x != app.processingWindowLastPos.x || currentPos.y != app.processingWindowLastPos.y);
+            if (posChanged && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                app.processingWindowUserMoved = true;
+            }
+        }
+
+        float deltaViewportX = viewport->Size.x - app.processingWindowLastViewportSize.x;
+        if (!app.processingWindowUserMoved) {
+            ImVec2 targetPos;
+            targetPos.x = std::max(16.0f, viewport->Pos.x + viewport->Size.x - currentSize.x - kRightMargin);
+            targetPos.y = currentPos.y;
+            if (targetPos.x != currentPos.x) {
+                ImGui::SetWindowPos(targetPos);
+            }
+        } else if (deltaViewportX != 0.0f) {
+            ImGui::SetWindowPos(ImVec2(currentPos.x + deltaViewportX, currentPos.y));
+        }
+
+        ClampWindowToViewport(topInset);
+        app.processingWindowLastPos = ImGui::GetWindowPos();
+        app.processingWindowLastViewportSize = viewport->Size;
+    }
+
+    if (expanded) {
         ImGui::TextUnformatted("Solver running...");
         ImGui::Text("Step %d", app.lbmStepCount.load(std::memory_order_relaxed));
 
@@ -3300,7 +3365,8 @@ enum class RibbonIcon {
     StyleSlice,
     StyleCloud,
     StyleParticles,
-    StyleStress
+    StyleStress,
+    StyleIso
 };
 
 void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIcon icon, ImU32 primaryCol,
@@ -3524,6 +3590,14 @@ void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIco
             dl->AddLine(tipL, tail, primaryCol, 1.7f);
             dl->AddLine(tail, tipR, primaryCol, 1.7f);
             dl->AddLine(tipR, nose, primaryCol, 1.7f);
+            break;
+        }
+        case RibbonIcon::StyleIso: {
+            // Contoured iso-surface 3D droplet / bulb shape
+            dl->AddEllipseFilled(ImVec2(center.x, center.y), ImVec2(r * 0.75f, r * 0.55f), IM_COL32(70, 190, 240, 180));
+            dl->AddEllipse(ImVec2(center.x, center.y), ImVec2(r * 0.75f, r * 0.55f), accentCol, 0.0f, 0, 1.8f);
+            dl->AddLine(ImVec2(center.x - r * 0.65f, center.y), ImVec2(center.x + r * 0.65f, center.y),
+                        IM_COL32(255, 255, 255, 130), 1.2f);
             break;
         }
     }
@@ -3931,6 +4005,12 @@ void DrawFusionRibbon(AppState& app, bool busy) {
                              app.lbmValid, "3D SDF-projected airframe surface stress map (Pa).", 68.0f)) {
             selectOverlayStyle(OverlayStyle::StressMap);
         }
+        ImGui::SameLine(0.0f, 2.0f);
+        if (RibbonIconButton("##rib_siso", "3D Iso", RibbonIcon::StyleIso,
+                             app.overlayStyle == OverlayStyle::IsoSurface && app.viewMode == ViewMode::FlowOverlay,
+                             app.lbmValid, "3D Iso-surface extraction (wake bubble / vortex core).", 50.0f)) {
+            selectOverlayStyle(OverlayStyle::IsoSurface);
+        }
         ImGui::SameLine(0.0f, 3.0f);
         if (RibbonIconButton("##rib_buildovl", "Update", RibbonIcon::BuildOverlay, false, !busy && app.lbmValid,
                              "Read back the solver field and rebuild the Flow Overlay.", 54.0f)) {
@@ -4222,6 +4302,7 @@ void DrawFusionInspector(AppState& app, bool busy) {
             ImGui::Checkbox("Invert X", &app.camera.invertX);
             ImGui::SameLine();
             ImGui::Checkbox("Invert Y", &app.camera.invertY);
+            ImGui::Checkbox("Invert Scroll Zoom", &app.camera.invertScrollZoom);
         } else if (app.activeTab == WorkspaceTab::Voxelize) {
             ImGui::BeginDisabled(busy);
             ImGui::SetNextItemWidth(140);
@@ -4483,9 +4564,9 @@ void DrawFusionInspector(AppState& app, bool busy) {
                 }
             } else {
                 int styleIndex = static_cast<int>(app.overlayStyle);
-                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map"};
+                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface"};
                 ImGui::SetNextItemWidth(200);
-                if (ImGui::Combo("Style", &styleIndex, styleNames, 4)) {
+                if (ImGui::Combo("Style", &styleIndex, styleNames, 5)) {
                     app.overlayStyle = static_cast<OverlayStyle>(styleIndex);
                     app.overlayStyleAtomic.store(static_cast<int>(app.overlayStyle), std::memory_order_relaxed);
                     StartResliceTask(app);
@@ -4497,6 +4578,59 @@ void DrawFusionInspector(AppState& app, bool busy) {
                     if (ImGui::Checkbox("Remove channel pressure gradient", &app.detrendPressure)) {
                         app.detrendPressureAtomic.store(app.detrendPressure, std::memory_order_relaxed);
                         app.voxelAlphaRangeInitialized = false;
+                        StartResliceTask(app);
+                    }
+                }
+
+                if (app.overlayStyle == OverlayStyle::IsoSurface) {
+                    int colorIndex = app.overlayColorMode == FieldColorMode::Speed ? 0 : 1;
+                    const char* colorNames[] = {"Speed", "Pressure"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Contour field", &colorIndex, colorNames, 2)) {
+                        app.overlayColorMode = colorIndex == 0 ? FieldColorMode::Speed : FieldColorMode::Pressure;
+                        app.overlayColorModeAtomic.store(static_cast<int>(app.overlayColorMode), std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    float lo = app.overlayColorMode == FieldColorMode::Speed ? app.cachedSpeedMin :
+                               (app.detrendPressure ? app.cachedPressureDetrendMin : app.cachedPressureMin);
+                    float hi = app.overlayColorMode == FieldColorMode::Speed ? app.cachedSpeedMax :
+                               (app.detrendPressure ? app.cachedPressureDetrendMax : app.cachedPressureMax);
+                    float currentVal = lo + app.isoThreshold * (hi - lo);
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Iso Threshold", &app.isoThreshold, 0.01f, 0.99f, "%.2f")) {
+                        app.isoThresholdAtomic.store(app.isoThreshold, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+                    if (app.overlayColorMode == FieldColorMode::Speed) {
+                        float speedMmS = LatticeSpeedToMmPerSecond(app, currentVal);
+                        ImGui::TextDisabled("Contour: %.1f mm/s", speedMmS);
+                    } else {
+                        ImGui::TextDisabled("Contour: %.4g lat. p", currentVal);
+                    }
+
+                    int encloseMode = app.isoEncloseGreater ? 1 : 0;
+                    const char* encloseNames[] = {"<= Iso (Wake / Suction)", ">= Iso (Jet / Stagnation)"};
+                    ImGui::SetNextItemWidth(190);
+                    if (ImGui::Combo("Enclose", &encloseMode, encloseNames, 2)) {
+                        app.isoEncloseGreater = (encloseMode == 1);
+                        app.isoEncloseGreaterAtomic.store(app.isoEncloseGreater, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Surface Opacity", &app.isoAlpha, 0.10f, 1.0f, "%.2f")) {
+                        app.isoAlphaAtomic.store(app.isoAlpha, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    int strideChoice = app.isoStride == 1 ? 0 : 1;
+                    const char* strideNames[] = {"Full (1x)", "Fast (2x Stride)"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Quality", &strideChoice, strideNames, 2)) {
+                        app.isoStride = strideChoice == 0 ? 1 : 2;
+                        app.isoStrideAtomic.store(app.isoStride, std::memory_order_relaxed);
                         StartResliceTask(app);
                     }
                 }
@@ -4768,6 +4902,7 @@ void DrawUI(AppState& app) {
         ImGui::Checkbox("Invert X", &app.camera.invertX);
         ImGui::SameLine();
         ImGui::Checkbox("Invert Y", &app.camera.invertY);
+        ImGui::Checkbox("Invert Scroll Zoom", &app.camera.invertScrollZoom);
 
         ImGui::Separator();
         ImGui::TextUnformatted("Display");
@@ -5496,9 +5631,9 @@ void DrawUI(AppState& app) {
                 ImGui::TextUnformatted("Flow Overlay");
 
                 int styleIndex = static_cast<int>(app.overlayStyle);
-                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map"};
+                const char* styleNames[] = {"Slice", "Voxel Cloud", "Particles (smoke trail)", "Airframe Stress Map", "3D Iso-Surface"};
                 ImGui::SetNextItemWidth(220);
-                if (ImGui::Combo("Style", &styleIndex, styleNames, 4)) {
+                if (ImGui::Combo("Style", &styleIndex, styleNames, 5)) {
                     app.overlayStyle = static_cast<OverlayStyle>(styleIndex);
                     app.overlayStyleAtomic.store(static_cast<int>(app.overlayStyle), std::memory_order_relaxed);
                     StartResliceTask(app);
@@ -5520,7 +5655,10 @@ void DrawUI(AppState& app) {
                         "opacity driven by Pressure (the same window).\n"
                         "Airframe Stress Map: projects exposed solid boundary\n"
                         "faces onto the sub-cell SDF surface and colors the\n"
-                        "skin by local aerodynamic stress (Pa).");
+                        "skin by local aerodynamic stress (Pa).\n"
+                        "3D Iso-Surface: parallel Marching Cubes extraction of\n"
+                        "smooth 3D boundary surfaces at chosen speed or pressure\n"
+                        "thresholds (e.g. wake bubbles or vortex cores).");
                 }
 
                 if (app.overlayStyle == OverlayStyle::StressMap) {
@@ -5545,6 +5683,59 @@ void DrawUI(AppState& app) {
                             "subtracts each cross-section's own mean pressure\n"
                             "before coloring/fading, removing that gradient so\n"
                             "the local effect is what shows.");
+                    }
+                }
+
+                if (app.overlayStyle == OverlayStyle::IsoSurface) {
+                    int colorIndex = app.overlayColorMode == FieldColorMode::Speed ? 0 : 1;
+                    const char* colorNames[] = {"Speed", "Pressure"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Contour field", &colorIndex, colorNames, 2)) {
+                        app.overlayColorMode = colorIndex == 0 ? FieldColorMode::Speed : FieldColorMode::Pressure;
+                        app.overlayColorModeAtomic.store(static_cast<int>(app.overlayColorMode), std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    float lo = app.overlayColorMode == FieldColorMode::Speed ? app.cachedSpeedMin :
+                               (app.detrendPressure ? app.cachedPressureDetrendMin : app.cachedPressureMin);
+                    float hi = app.overlayColorMode == FieldColorMode::Speed ? app.cachedSpeedMax :
+                               (app.detrendPressure ? app.cachedPressureDetrendMax : app.cachedPressureMax);
+                    float currentVal = lo + app.isoThreshold * (hi - lo);
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Iso Threshold", &app.isoThreshold, 0.01f, 0.99f, "%.2f")) {
+                        app.isoThresholdAtomic.store(app.isoThreshold, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+                    if (app.overlayColorMode == FieldColorMode::Speed) {
+                        float speedMmS = LatticeSpeedToMmPerSecond(app, currentVal);
+                        ImGui::TextDisabled("Contour: %.1f mm/s", speedMmS);
+                    } else {
+                        ImGui::TextDisabled("Contour: %.4g lat. p", currentVal);
+                    }
+
+                    int encloseMode = app.isoEncloseGreater ? 1 : 0;
+                    const char* encloseNames[] = {"<= Iso (Wake / Suction)", ">= Iso (Jet / Stagnation)"};
+                    ImGui::SetNextItemWidth(190);
+                    if (ImGui::Combo("Enclose", &encloseMode, encloseNames, 2)) {
+                        app.isoEncloseGreater = (encloseMode == 1);
+                        app.isoEncloseGreaterAtomic.store(app.isoEncloseGreater, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::SliderFloat("Surface Opacity", &app.isoAlpha, 0.10f, 1.0f, "%.2f")) {
+                        app.isoAlphaAtomic.store(app.isoAlpha, std::memory_order_relaxed);
+                        StartResliceTask(app);
+                    }
+
+                    int strideChoice = app.isoStride == 1 ? 0 : 1;
+                    const char* strideNames[] = {"Full (1x)", "Fast (2x Stride)"};
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::Combo("Quality", &strideChoice, strideNames, 2)) {
+                        app.isoStride = strideChoice == 0 ? 1 : 2;
+                        app.isoStrideAtomic.store(app.isoStride, std::memory_order_relaxed);
+                        StartResliceTask(app);
                     }
                 }
 
@@ -6180,6 +6371,10 @@ int main(int, char**) {
         app.voxelAlphaPressureHiAtomic.store(app.voxelAlphaPressureHi, std::memory_order_relaxed);
         app.detrendPressureAtomic.store(app.detrendPressure, std::memory_order_relaxed);
         app.voxelNegativePressureGreyAtomic.store(app.voxelNegativePressureGrey, std::memory_order_relaxed);
+        app.isoThresholdAtomic.store(app.isoThreshold, std::memory_order_relaxed);
+        app.isoAlphaAtomic.store(app.isoAlpha, std::memory_order_relaxed);
+        app.isoEncloseGreaterAtomic.store(app.isoEncloseGreater, std::memory_order_relaxed);
+        app.isoStrideAtomic.store(app.isoStride, std::memory_order_relaxed);
         {
             Vec3 forward = app.camera.GetBasis().forward;
             app.cameraForwardXAtomic.store(forward.x, std::memory_order_relaxed);
@@ -6234,6 +6429,17 @@ int main(int, char**) {
                     // front-facing surfaces properly occlude back-facing
                     // ones without z-fighting against the CAD mesh.
                     app.overlayRenderer.Render(cmd, swapchainTexture, width, height, view, proj, clearColor, nullptr);
+                } else if (app.overlayStyle == OverlayStyle::IsoSurface && app.isoAlpha >= 0.98f) {
+                    // Fully opaque 3D Iso-surface renders with depth write enabled
+                    if (app.overlayShowModel && app.renderer.HasMesh()) {
+                        Mat4 model = ModelMatrix(app);
+                        app.renderer.Render(cmd, swapchainTexture, width, height, view, proj, model, app.camera.Eye(),
+                                            clearColor);
+                        app.overlayRenderer.Render(cmd, swapchainTexture, width, height, view, proj, clearColor,
+                                                   app.renderer.DepthTexture());
+                    } else {
+                        app.overlayRenderer.Render(cmd, swapchainTexture, width, height, view, proj, clearColor, nullptr);
+                    }
                 } else {
                     // Particles are drawn either for the Particles style
                     // itself, or confined to the plane in place of the

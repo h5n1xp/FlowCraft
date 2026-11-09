@@ -1,4 +1,5 @@
 #include "FieldOverlay.h"
+#include "MarchingCubesTables.h"
 
 #include <algorithm>
 #include <cmath>
@@ -766,6 +767,123 @@ OverlayMesh FieldOverlay::BuildStressMapMesh(const VoxelGrid& grid, const std::v
                         local.indices.push_back(base + 0);
                         local.indices.push_back(base + 2);
                         local.indices.push_back(base + 3);
+                    }
+                }
+            }
+        }
+    });
+
+    for (const OverlayMesh& local : partials) {
+        AppendMesh(mesh, local);
+    }
+    return mesh;
+}
+
+OverlayMesh FieldOverlay::BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::vector<float>& field,
+                                                FieldColorMode mode, float isoValue, float lo, float hi,
+                                                float alpha, bool encloseGreater, int stride,
+                                                const std::vector<float>* xMeans) {
+    OverlayMesh mesh;
+    if (field.size() != grid.CellCount() * 4 || grid.nx < 2 || grid.ny < 2 || grid.nz < 2) return mesh;
+    stride = std::max(1, stride);
+
+    float invRange = 1.0f / std::max(hi - lo, 1e-6f);
+    float tColor = std::clamp((isoValue - lo) * invRange, 0.0f, 1.0f);
+    Vec3 baseColor = Colormap(tColor);
+    const Vec3 kLightDir = Normalize(Vec3{0.45f, -0.55f, 0.70f});
+
+    auto sampleVal = [&](int x, int y, int z) -> float {
+        x = std::clamp(x, 0, grid.nx - 1);
+        y = std::clamp(y, 0, grid.ny - 1);
+        z = std::clamp(z, 0, grid.nz - 1);
+        size_t c = grid.Index(x, y, z);
+        if (grid.solid[c]) {
+            return encloseGreater ? -1e30f : 1e30f;
+        }
+        float v = FieldValueMaybeDetrended(field, c, x, mode, xMeans);
+        if (!std::isfinite(v)) {
+            return encloseGreater ? -1e30f : 1e30f;
+        }
+        return v;
+    };
+
+    auto gradWorld = [&](int x, int y, int z) -> Vec3 {
+        float gx = (sampleVal(x + stride, y, z) - sampleVal(x - stride, y, z)) * 0.5f;
+        float gy = (sampleVal(x, y + stride, z) - sampleVal(x, y - stride, z)) * 0.5f;
+        float gz = (sampleVal(x, y, z + stride) - sampleVal(x, y, z - stride)) * 0.5f;
+        // Swap grid-x (world-Y) and grid-y (world-X)
+        return Vec3{gy, gx, gz};
+    };
+
+    unsigned int numThreads = ParallelForZThreadCount(grid.nz - 1);
+    std::vector<OverlayMesh> partials(numThreads);
+
+    ParallelForZ(grid.nz - 1, [&](int zBegin, int zEnd, unsigned int threadIndex) {
+        OverlayMesh& local = partials[threadIndex];
+        int zStartAligned = (zBegin / stride) * stride;
+        for (int z = zStartAligned; z < zEnd; z += stride) {
+            if (z < zBegin) continue;
+            int zNext = std::min(z + stride, grid.nz - 1);
+            if (zNext == z) continue;
+
+            for (int y = 0; y + 1 < grid.ny; y += stride) {
+                int yNext = std::min(y + stride, grid.ny - 1);
+                for (int x = 0; x + 1 < grid.nx; x += stride) {
+                    int xNext = std::min(x + stride, grid.nx - 1);
+
+                    int cx[8] = {x, xNext, xNext, x, x, xNext, xNext, x};
+                    int cy[8] = {y, y, yNext, yNext, y, y, yNext, yNext};
+                    int cz[8] = {z, z, z, z, zNext, zNext, zNext, zNext};
+
+                    float val[8];
+                    int cubeIndex = 0;
+                    for (int k = 0; k < 8; ++k) {
+                        val[k] = sampleVal(cx[k], cy[k], cz[k]);
+                        bool inside = encloseGreater ? (val[k] >= isoValue) : (val[k] <= isoValue);
+                        if (inside) cubeIndex |= (1 << k);
+                    }
+
+                    int edgeMask = MarchingCubes::kEdgeTable[cubeIndex];
+                    if (edgeMask == 0) continue;
+
+                    OverlayVertex edgeVerts[12];
+                    for (int e = 0; e < 12; ++e) {
+                        if (!(edgeMask & (1 << e))) continue;
+                        int c0 = MarchingCubes::kEdgeCorners[e][0];
+                        int c1 = MarchingCubes::kEdgeCorners[e][1];
+                        float v0 = val[c0];
+                        float v1 = val[c1];
+                        float denom = v1 - v0;
+                        float t = (std::fabs(denom) > 1e-12f) ? std::clamp((isoValue - v0) / denom, 0.0f, 1.0f) : 0.5f;
+
+                        Vec3 p0 = grid.CellCenter(cx[c0], cy[c0], cz[c0]);
+                        Vec3 p1 = grid.CellCenter(cx[c1], cy[c1], cz[c1]);
+                        Vec3 pos = p0 + (p1 - p0) * t;
+
+                        Vec3 g0 = gradWorld(cx[c0], cy[c0], cz[c0]);
+                        Vec3 g1 = gradWorld(cx[c1], cy[c1], cz[c1]);
+                        Vec3 grad = g0 + (g1 - g0) * t;
+                        float glen = Length(grad);
+                        Vec3 normal = (glen > 1e-5f) ? (grad * (1.0f / glen)) : Vec3{0.0f, 0.0f, 1.0f};
+                        if (!encloseGreater) normal = normal * -1.0f;
+
+                        float ndotl = std::fabs(Dot(normal, kLightDir));
+                        float hemi = 0.5f + 0.5f * std::fabs(normal.z);
+                        float shade = 0.62f + 0.28f * ndotl + 0.10f * hemi;
+                        edgeVerts[e] = {pos, baseColor * shade, alpha};
+                    }
+
+                    for (int i = 0; MarchingCubes::kTriTable[cubeIndex][i] != -1; i += 3) {
+                        int e0 = MarchingCubes::kTriTable[cubeIndex][i + 0];
+                        int e1 = MarchingCubes::kTriTable[cubeIndex][i + 1];
+                        int e2 = MarchingCubes::kTriTable[cubeIndex][i + 2];
+                        uint32_t base = static_cast<uint32_t>(local.vertices.size());
+                        local.vertices.push_back(edgeVerts[e0]);
+                        local.vertices.push_back(edgeVerts[e1]);
+                        local.vertices.push_back(edgeVerts[e2]);
+                        local.indices.push_back(base + 0);
+                        local.indices.push_back(base + 1);
+                        local.indices.push_back(base + 2);
                     }
                 }
             }

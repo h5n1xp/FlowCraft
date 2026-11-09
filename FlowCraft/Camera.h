@@ -28,7 +28,8 @@ public:
     }
 
     void OnScroll(float amount) {
-        distance = std::clamp(distance * std::pow(0.9f, amount), minDistance, maxDistance);
+        float effectiveAmount = invertScrollZoom ? -amount : amount;
+        distance = std::clamp(distance * std::pow(0.9f, effectiveAmount), minDistance, maxDistance);
     }
 
     // Z-up, X-forward world convention (see main.cpp's kYawAxis/kPitchAxis
@@ -128,4 +129,5 @@ public:
     float sceneRadius = 2.0f;
     bool invertX = false;
     bool invertY = false;
+    bool invertScrollZoom = false;
 };
