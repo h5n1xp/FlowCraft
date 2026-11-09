@@ -15,6 +15,7 @@ Several visualisations are available; "smoke" trails, colour map (pressure/speed
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot2.jpg" alt="Colour map" width="500" />
 <img src="ScreenShot3.jpg" alt="LBM Turbulence" width="500" />
+<img src="ScreenShot5.jpg" alt="LBM Turbulence" width="500" />
 
 As a nice bonus, the visualiser can also show pressure stress on the airframe, which can help when designing a model to see where extra support might be needed.<br>
 <img src="ScreenShot4.jpg" alt="Airframe Stress" width="500" />
