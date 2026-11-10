@@ -106,6 +106,9 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
     panels_.clear();
     wakeStrips_.clear();
     boundarySolidCells_.clear();
+    liftingSamples_.clear();
+    minY_ = 0;
+    maxY_ = -1;
 
     struct BoundarySample {
         size_t cellIndex;
@@ -246,11 +249,27 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         panels_.push_back(panel);
     }
 
+    minY_ = minY;
+    maxY_ = maxY;
+    for (const BoundarySample& s : samples) {
+        if (std::fabs(s.normal.z) < 0.35f) continue;
+        liftingSamples_.push_back({s.surfacePos, s.normal, s.area});
+    }
+
+    BuildWakeStrips();
+    RebuildInfluenceMatrices();
+}
+
+void PanelSolver::BuildWakeStrips() {
+    wakeStrips_.clear();
+    if (liftingSamples_.empty() || maxY_ < minY_) return;
+
     // 2. Build spanwise lifting strips (Horseshoe Vortex Lattice + Trailing-Edge
     // Kutta condition). Divide the model's Y-span into up to 48 strips, using
     // only lifting-surface boundary samples (|normal.z| >= 0.35) so vertical
     // tail fins and fuselage sidewalls do not skew the strip chord or camber.
-    int numStrips = std::clamp((maxY - minY + 1) / 3, 6, 48);
+    float spanY = static_cast<float>(std::max(1, maxY_ - minY_ + 1));
+    int numStrips = std::clamp((maxY_ - minY_ + 1) / 3, 6, 48);
     float stripWidth = spanY / static_cast<float>(numStrips);
 
     struct StripGeom {
@@ -263,9 +282,8 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
     };
     std::vector<StripGeom> stripGeoms(numStrips);
 
-    for (const BoundarySample& s : samples) {
-        if (std::fabs(s.normal.z) < 0.35f) continue;
-        int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY)) / stripWidth),
+    for (const LiftingSample& s : liftingSamples_) {
+        int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY_)) / stripWidth),
                               0, numStrips - 1);
         StripGeom& g = stripGeoms[sIdx];
         g.xMin = std::min(g.xMin, s.surfacePos.x);
@@ -276,9 +294,8 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
 
     bool rev = params_.reverseFlow;
     float flowSign = rev ? -1.0f : 1.0f;
-    for (const BoundarySample& s : samples) {
-        if (std::fabs(s.normal.z) < 0.35f) continue;
-        int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY)) / stripWidth),
+    for (const LiftingSample& s : liftingSamples_) {
+        int sIdx = std::clamp(static_cast<int>((s.surfacePos.y - static_cast<float>(minY_)) / stripWidth),
                               0, numStrips - 1);
         StripGeom& g = stripGeoms[sIdx];
         if (g.totalCount == 0) continue;
@@ -304,7 +321,7 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
         const StripGeom& g = stripGeoms[sIdx];
         if (g.totalCount < 3 || g.xMax <= g.xMin + 1.0f) continue;
 
-        float yLeft = static_cast<float>(minY) + static_cast<float>(sIdx) * stripWidth;
+        float yLeft = static_cast<float>(minY_) + static_cast<float>(sIdx) * stripWidth;
         float yRight = yLeft + stripWidth;
         float yMid = 0.5f * (yLeft + yRight);
 
@@ -354,7 +371,6 @@ void PanelSolver::BuildPanelsAndWake(const VoxelGrid& grid) {
     }
 
     influenceFlowReversed_ = params_.reverseFlow;
-    RebuildInfluenceMatrices();
 }
 
 void PanelSolver::RebuildInfluenceMatrices() {
@@ -401,12 +417,13 @@ void PanelSolver::RebuildInfluenceMatrices() {
             wakeToWake_[k * W + s] = val;
             if (s != k) offDiagWake += std::fabs(val);
         }
-        // Weissinger 2D thin-airfoil self-influence (-4 / chord per unit
-        // Gamma / 4pi) combined with the 3D horseshoe downwash and strict
-        // diagonal dominance so circulation stays physically bounded.
-        float twoDSelf = -4.0f / std::max(wakeStrips_[k].chord, 1.0f);
-        float diag = std::min(wakeToWake_[k * W + k], twoDSelf);
-        wakeStrips_[k].selfDiag = -std::max({std::fabs(diag), 1.15f * offDiagWake, 1e-3f});
+        // Weissinger 2D thin-airfoil self-influence (-flowSign * 4 / chord per
+        // unit Gamma / 4pi) combined with the 3D horseshoe downwash and strict
+        // diagonal dominance so circulation stays physically bounded in both
+        // forward (+X) and reversed (-X) flow directions.
+        float twoDSelfMag = 4.0f / std::max(wakeStrips_[k].chord, 1.0f);
+        float diagMag = std::max(std::fabs(wakeToWake_[k * W + k]), twoDSelfMag);
+        wakeStrips_[k].selfDiag = -flowSign * std::max({diagMag, 1.15f * offDiagWake, 1e-3f});
     }
 }
 
@@ -537,7 +554,12 @@ void PanelSolver::Shutdown() {
 }
 
 void PanelSolver::Reset(const Params& params) {
+    bool dirChanged = (params.reverseFlow != influenceFlowReversed_);
     params_ = params;
+    if (dirChanged) {
+        BuildWakeStrips();
+        RebuildInfluenceMatrices();
+    }
     for (SurfacePanel& p : panels_) p.sigma = 0.0f;
     for (WakeStrip& w : wakeStrips_) w.gamma = 0.0f;
     // Run an initial surface solve so the panel and wake strengths are
@@ -557,9 +579,16 @@ void PanelSolver::Reset(const Params& params) {
 
 void PanelSolver::SetParams(const Params& params) {
     bool dirChanged = (params.reverseFlow != params_.reverseFlow);
+    bool velChanged = (params.inletVelocity != params_.inletVelocity);
     params_ = params;
     if (dirChanged) {
+        BuildWakeStrips();
         RebuildInfluenceMatrices();
+        for (SurfacePanel& p : panels_) p.sigma = 0.0f;
+        for (WakeStrip& w : wakeStrips_) w.gamma = 0.0f;
+        StepSurfaceOnly(12);
+    } else if (velChanged) {
+        StepSurfaceOnly(12);
     }
     gpuFieldDirty_ = true;
 }
@@ -940,9 +969,13 @@ std::vector<float> PanelSolver::ReadbackField() {
 }
 
 PanelSolver::Stats PanelSolver::ComputeStats() {
-    Stats stats;
     std::vector<float> field = ReadbackField();
-    if (field.empty()) return stats;
+    return ComputeStatsFromField(field);
+}
+
+PanelSolver::Stats PanelSolver::ComputeStatsFromField(const std::vector<float>& field) const {
+    Stats stats;
+    if (field.size() != cellCount_ * 4) return stats;
 
     double densitySum = 0.0, speedSum = 0.0;
     float minDensity = 1e30f, maxDensity = -1e30f, maxSpeed = 0.0f;

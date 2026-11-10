@@ -3744,7 +3744,7 @@ void TriggerRefreshStats(AppState& app) {
         field = app.lbmReference.ReadbackField();
     } else if (IsPanelBackend(app.lbmBackend)) {
         field = app.panelSolver.ReadbackField();
-        PanelSolver::Stats pStats = app.panelSolver.ComputeStats();
+        PanelSolver::Stats pStats = app.panelSolver.ComputeStatsFromField(field);
         app.lbmLastStats.avgDensity = pStats.avgDensity;
         app.lbmLastStats.minDensity = pStats.minDensity;
         app.lbmLastStats.maxDensity = pStats.maxDensity;

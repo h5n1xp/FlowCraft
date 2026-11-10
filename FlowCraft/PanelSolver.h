@@ -89,6 +89,7 @@ public:
     void FinalizeReadbackField(std::vector<float>& field) const;
 
     Stats ComputeStats();
+    Stats ComputeStatsFromField(const std::vector<float>& field) const;
 
     int Nx() const { return nx_; }
     int Ny() const { return ny_; }
@@ -126,7 +127,14 @@ private:
         SDL_GPUBuffer* macroOut = nullptr;
     };
 
+    struct LiftingSample {
+        Vec3 surfacePos;
+        Vec3 normal;
+        float area = 1.0f;
+    };
+
     void BuildPanelsAndWake(const VoxelGrid& grid);
+    void BuildWakeStrips();
     void RebuildInfluenceMatrices();
     void UploadSingularityBuffers();
     void DispatchSlabGPU(SDL_GPUCommandBuffer* cmd, size_t slabIndex, int localZOffset, int localZCount);
@@ -158,6 +166,8 @@ private:
 
     // Exposed boundary solid cell indices for fast surface stress/force computation
     std::vector<size_t> boundarySolidCells_;
+    std::vector<LiftingSample> liftingSamples_;
+    int minY_ = 0, maxY_ = -1;
 
     // GPU resources (only allocated when useGpu_ == true)
     SDL_GPUComputePipeline* pipeline_ = nullptr;
