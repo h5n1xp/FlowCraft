@@ -213,6 +213,14 @@ public:
     // measurement).
     void ReadbackFieldRange(int zStart, int zCount, std::vector<float>& outField);
 
+    // Lightweight live health probe: downloads only a single Z-layer of
+    // macroOut (4 floats * nx_ * ny_ bytes) and returns true if any cell on
+    // that layer has NaN/Inf or unphysical density/velocity blowup (rho <= 0
+    // or speed > 2.0 in lattice units). Used by StepSolverPaced to detect
+    // numerical divergence early at high resolution without paying for a
+    // full-domain readback.
+    bool ProbeSliceHealth(int zLayer);
+
     const std::vector<uint8_t>& SolidMask() const { return solidCpu_; }
 
     bool IsValid() const { return pipeline_ != nullptr; }

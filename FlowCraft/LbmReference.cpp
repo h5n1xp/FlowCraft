@@ -213,10 +213,12 @@ void LbmReference::Reset(bool seedAtMidSpeed) {
         }
     });
     current_ = 0;
+    hasDiverged_.store(false, std::memory_order_relaxed);
 }
 
 void LbmReference::ResetFromField(const std::vector<float>& field) {
     if (field.size() != cellCount_ * 4) return;
+    hasDiverged_.store(false, std::memory_order_relaxed);
     // Same parallel-by-Z-slab shape as Reset() above, just reading each
     // cell's own (rho,ux,uy,uz) from `field` (GLOBAL-indexed, same
     // layout ReadbackField() returns) instead of one value closed over
@@ -253,6 +255,7 @@ void LbmReference::Step(std::atomic<float>* progress, int substepIndex, int subs
     float inletUx = params_.reverseFlow ? -params_.inletVelocity : params_.inletVelocity;
 
     ParallelForZ(nz_, [&](int zBegin, int zEnd, unsigned int /*threadIndex*/) {
+        bool localDiverged = false;
         for (int z = zBegin; z < zEnd; ++z) {
             for (int y = 0; y < ny_; ++y) {
                 for (int x = 0; x < nx_; ++x) {
@@ -391,6 +394,10 @@ void LbmReference::Step(std::atomic<float>* progress, int substepIndex, int subs
                         uy /= rho;
                         uz /= rho;
                     }
+                    if (!std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz) ||
+                        rho <= 0.0f || (ux * ux + uy * uy + uz * uz) > 4.0f) {
+                        localDiverged = true;
+                    }
 
                     // Regularized collision (Latt & Chopard): rather than
                     // relaxing fpre directly (plain BGK), project its
@@ -453,6 +460,9 @@ void LbmReference::Step(std::atomic<float>* progress, int substepIndex, int subs
                                  std::memory_order_relaxed);
             }
         }
+        if (localDiverged) {
+            hasDiverged_.store(true, std::memory_order_relaxed);
+        }
     });
 
     current_ = 1 - current_;
@@ -466,6 +476,7 @@ std::vector<float> LbmReference::ReadbackField() const {
     std::vector<float> field(cellCount_ * 4);
     const std::vector<float>& fCur = f_[current_];
     ParallelForZ(nz_, [&](int zBegin, int zEnd, unsigned int /*threadIndex*/) {
+        bool localDiverged = false;
         for (int z = zBegin; z < zEnd; ++z) {
             for (int y = 0; y < ny_; ++y) {
                 for (int x = 0; x < nx_; ++x) {

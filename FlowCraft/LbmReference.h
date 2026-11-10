@@ -126,6 +126,7 @@ public:
     int Nx() const { return nx_; }
     int Ny() const { return ny_; }
     int Nz() const { return nz_; }
+    bool HasDiverged() const { return hasDiverged_.load(std::memory_order_relaxed); }
 
 private:
     static constexpr int kMaxQ = 19;
@@ -176,4 +177,5 @@ private:
     std::vector<int> mirrorY_, mirrorZ_;
     std::vector<float> f_[2];
     int current_ = 0;
+    std::atomic<bool> hasDiverged_{false};
 };

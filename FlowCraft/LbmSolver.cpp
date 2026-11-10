@@ -650,6 +650,75 @@ void LbmSolver::ReadbackFieldRange(int zStart, int zCount, std::vector<float>& o
     SDL_UnmapGPUTransferBuffer(device_, readbackTransfer_);
 }
 
+bool LbmSolver::ProbeSliceHealth(int zLayer) {
+    if (!pipeline_ || !device_ || nz_ <= 0) return false;
+    int gz = std::clamp(zLayer, 0, nz_ - 1);
+    size_t cellsPerLayer = static_cast<size_t>(nx_) * ny_;
+    if (cellsPerLayer == 0) return false;
+
+    const Slab* targetSlab = nullptr;
+    int localZ = 0;
+    for (const Slab& slab : slabs_) {
+        if (gz >= slab.zStart && gz < slab.zStart + slab.zCount) {
+            targetSlab = &slab;
+            localZ = gz - slab.zStart;
+            break;
+        }
+    }
+    if (!targetSlab || !targetSlab->macroOut) return false;
+
+    uint32_t byteSize = static_cast<uint32_t>(cellsPerLayer * 4 * sizeof(float));
+    uint32_t srcByteOffset = static_cast<uint32_t>(static_cast<size_t>(localZ) * cellsPerLayer * 4 * sizeof(float));
+
+    if (byteSize > readbackTransferCapacityBytes_) {
+        if (readbackTransfer_) SDL_ReleaseGPUTransferBuffer(device_, readbackTransfer_);
+        SDL_GPUTransferBufferCreateInfo tbInfo = {};
+        tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+        tbInfo.size = byteSize;
+        readbackTransfer_ = SDL_CreateGPUTransferBuffer(device_, &tbInfo);
+        readbackTransferCapacityBytes_ = readbackTransfer_ ? byteSize : 0;
+    }
+    if (!readbackTransfer_) return false;
+
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_);
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUBufferRegion src = {targetSlab->macroOut, srcByteOffset, byteSize};
+    SDL_GPUTransferBufferLocation dst = {readbackTransfer_, 0};
+    SDL_DownloadFromGPUBuffer(copyPass, &src, &dst);
+    SDL_EndGPUCopyPass(copyPass);
+
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (fence) {
+        SDL_WaitForGPUFences(device_, true, &fence, 1);
+        SDL_ReleaseGPUFence(device_, fence);
+    }
+
+    bool diverged = false;
+    const float* mapped = static_cast<const float*>(SDL_MapGPUTransferBuffer(device_, readbackTransfer_, false));
+    if (mapped) {
+        size_t globalCellBase = static_cast<size_t>(gz) * cellsPerLayer;
+        for (size_t i = 0; i < cellsPerLayer; ++i) {
+            float v0 = mapped[i * 4 + 0];
+            float v1 = mapped[i * 4 + 1];
+            float v2 = mapped[i * 4 + 2];
+            float v3 = mapped[i * 4 + 3];
+            if (!std::isfinite(v0) || !std::isfinite(v1) || !std::isfinite(v2) || !std::isfinite(v3)) {
+                diverged = true;
+                break;
+            }
+            if (!solidCpu_[globalCellBase + i]) {
+                float speedSq = v1 * v1 + v2 * v2 + v3 * v3;
+                if (v0 <= 0.0f || speedSq > 4.0f) {
+                    diverged = true;
+                    break;
+                }
+            }
+        }
+        SDL_UnmapGPUTransferBuffer(device_, readbackTransfer_);
+    }
+    return diverged;
+}
+
 std::vector<float> LbmSolver::ReadbackField() {
     std::vector<float> field;
     if (!pipeline_) return field;

@@ -443,6 +443,16 @@ struct AppState {
     std::atomic<bool> lbmStatsHasNaNAtomic{false};
     std::atomic<bool> lbmStatsValidAtomic{false};
 
+    // Live flow divergence / NaN health monitor: tracks whether the solver
+    // has blown up (NaN, Inf, negative density, or supersonic lattice speed),
+    // which step it failed at, and whether to auto-pause immediately so high-
+    // resolution runs don't waste minutes computing purple NaN cells.
+    std::atomic<bool> lbmFlowDivergedAtomic{false};
+    std::atomic<int> lbmDivergedAtStepAtomic{0};
+    std::atomic<bool> divergenceBannerDismissedAtomic{false};
+    bool autoPauseOnDivergence = true;
+    std::atomic<bool> autoPauseOnDivergenceAtomic{true};
+
     // Aerodynamic forces (Wen et al. / Ladd Bouzidi momentum exchange),
     // peak surface stress in lattice units, and Centre of Pressure in
     // world coordinates (mm), updated both by Refresh Stats and
@@ -1082,6 +1092,28 @@ void StartVoxelizeTask(AppState& app) {
 // result" block in the main loop applies when a *fresh* Voxelize
 // replaces the grid: whatever solver exists was sized/seeded for the
 // grid that's going away, so it can't be left looking valid.
+void ClearFlowDivergence(AppState& app) {
+    app.lbmFlowDivergedAtomic.store(false, std::memory_order_relaxed);
+    app.lbmDivergedAtStepAtomic.store(0, std::memory_order_relaxed);
+    app.divergenceBannerDismissedAtomic.store(false, std::memory_order_relaxed);
+    app.lbmStatsHasNaNAtomic.store(false, std::memory_order_relaxed);
+    app.overlayHasNaN = false;
+    app.pendingOverlayHasNaN = false;
+}
+
+void FlagFlowDivergence(AppState& app) {
+    app.lbmStatsHasNaNAtomic.store(true, std::memory_order_relaxed);
+    if (!app.lbmFlowDivergedAtomic.exchange(true, std::memory_order_acq_rel)) {
+        app.lbmDivergedAtStepAtomic.store(app.lbmStepCount.load(std::memory_order_relaxed),
+                                           std::memory_order_relaxed);
+        app.divergenceBannerDismissedAtomic.store(false, std::memory_order_relaxed);
+        if (app.autoPauseOnDivergenceAtomic.load(std::memory_order_relaxed)) {
+            app.lbmRunning.store(false, std::memory_order_release);
+            app.showProcessingWindow = true;
+        }
+    }
+}
+
 void ResetVoxelization(AppState& app) {
     app.voxelGridValid = false;
     app.voxelGrid = VoxelGrid{};
@@ -1091,6 +1123,7 @@ void ResetVoxelization(AppState& app) {
     app.lbmRunning = false;
     app.lbmForcesValidAtomic.store(false, std::memory_order_relaxed);
     app.overlayValid = false;
+    ClearFlowDivergence(app);
     // -1 so each plane (whichever are still enabled — that choice itself
     // persists across re-voxelization, same as before) re-defaults to the
     // *new* grid's own center rather than keeping a position sized for
@@ -1491,6 +1524,7 @@ void InitLbmSolver(AppState& app) {
         app.lbmStepCount = 0;
         app.lbmLastStats = LbmSolver::Stats{};
         SyncLbmStatsAtomics(app);
+        ClearFlowDivergence(app);
     }
 
     // Unconditional final snap to 100%, regardless of which path above
@@ -1514,6 +1548,17 @@ void InitLbmSolver(AppState& app) {
 void StartInitSolverTask(AppState& app) {
     if (!app.voxelGridValid) return;
     StartTask(app, TaskKind::InitializingSolver, /*hasProgress=*/true, [&app]() { InitLbmSolver(app); });
+}
+
+void StabilizeAndResetSolver(AppState& app) {
+    if (!app.voxelGridValid) return;
+    {
+        std::lock_guard<std::mutex> lock(app.lbmMutex);
+        app.lbmParams.smagorinskyCs = std::max(app.lbmParams.smagorinskyCs, 0.18f);
+        app.lbmParams.tau = std::max(app.lbmParams.tau, 0.53f);
+        app.lbmTauAtomic.store(app.lbmParams.tau, std::memory_order_relaxed);
+    }
+    StartInitSolverTask(app);
 }
 
 int OverlaySliceDimension(const AppState& app, SliceAxis axis) {
@@ -1740,6 +1785,10 @@ void BuildOverlayMeshFromField(AppState& app, const std::vector<float>& field) {
     app.lbmCpZAtomic.store(aero.centerOfPressure.z, std::memory_order_relaxed);
     app.lbmLiftBaseZAtomic.store(aero.liftArrowBase.z, std::memory_order_relaxed);
     app.lbmForcesValidAtomic.store(true, std::memory_order_relaxed);
+
+    if (speedHasNaN || pressureHasNaN || aero.hasNaN) {
+        FlagFlowDivergence(app);
+    }
 
     bool detrend = app.detrendPressureAtomic.load(std::memory_order_relaxed);
     float pressureLoUsed = detrend ? pressureDetrendLo : pressureLo;
@@ -2058,10 +2107,15 @@ void StartBuildOverlayTask(AppState& app) {
 // (UI thread) and the background solver thread's continuous stepping, so
 // the two can never touch lbmSolver at the same time.
 void StepSolverLocked(AppState& app, int substeps) {
-    std::lock_guard<std::mutex> lock(app.lbmMutex);
-    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(app.gpuDevice);
-    app.lbmSolver.Step(cmd, substeps);
-    SDL_SubmitGPUCommandBuffer(cmd);
+    bool diverged = false;
+    {
+        std::lock_guard<std::mutex> lock(app.lbmMutex);
+        SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(app.gpuDevice);
+        app.lbmSolver.Step(cmd, substeps);
+        SDL_SubmitGPUCommandBuffer(cmd);
+        diverged = app.lbmSolver.ProbeSliceHealth(app.lbmSolver.Nz() / 2);
+    }
+    if (diverged) FlagFlowDivergence(app);
 }
 
 // CPU-backend equivalent of StepSolverLocked/StepSolverPaced. Much
@@ -2076,7 +2130,13 @@ void StepSolverLocked(AppState& app, int substeps) {
 void StepReferenceLocked(AppState& app, int substeps) {
     std::lock_guard<std::mutex> lock(app.lbmMutex);
     app.lbmStepProgress.store(0.0f, std::memory_order_relaxed);
-    for (int i = 0; i < substeps; ++i) app.lbmReference.Step(&app.lbmStepProgress, i, substeps);
+    for (int i = 0; i < substeps; ++i) {
+        app.lbmReference.Step(&app.lbmStepProgress, i, substeps);
+        if (app.lbmReference.HasDiverged()) {
+            FlagFlowDivergence(app);
+            if (!app.lbmRunning.load(std::memory_order_acquire)) break;
+        }
+    }
 }
 
 // Naive-backend equivalent — PotentialFlowSolver::Step() is likewise a
@@ -2219,8 +2279,28 @@ void StepSolverPaced(AppState& app, int substeps) {
                 std::memory_order_relaxed);
         }
 
-        std::lock_guard<std::mutex> lock(app.lbmMutex);
-        app.lbmSolver.AdvanceSubstep();
+        static Uint64 lastHealthProbeTicks = 0;
+        static int healthProbePhase = 0;
+        constexpr Uint64 kHealthProbeIntervalMs = 400;
+        Uint64 nowTicks = SDL_GetTicks();
+        bool doProbe = (nowTicks - lastHealthProbeTicks >= kHealthProbeIntervalMs);
+        bool diverged = false;
+        {
+            std::lock_guard<std::mutex> lock(app.lbmMutex);
+            app.lbmSolver.AdvanceSubstep();
+            if (doProbe && nz > 0) {
+                lastHealthProbeTicks = nowTicks;
+                int probeZ = (healthProbePhase == 0) ? (nz / 2)
+                           : (healthProbePhase == 1) ? (nz / 3)
+                                                     : ((2 * nz) / 3);
+                healthProbePhase = (healthProbePhase + 1) % 3;
+                diverged = app.lbmSolver.ProbeSliceHealth(probeZ);
+            }
+        }
+        if (diverged) {
+            FlagFlowDivergence(app);
+            if (!app.lbmRunning.load(std::memory_order_acquire)) break;
+        }
     }
 }
 
@@ -2441,6 +2521,7 @@ void ResetStateForNewMesh(AppState& app) {
     app.lbmRunning = false;
     app.lbmForcesValidAtomic.store(false, std::memory_order_relaxed);
     app.overlayValid = false;
+    ClearFlowDivergence(app);
     for (AppState::SlicePlaneState& plane : app.slicePlanes) {
         plane.index = -1;
         plane.indexAtomic.store(-1, std::memory_order_relaxed);
@@ -3292,7 +3373,9 @@ void DrawBusyOverlay(const AppState& app) {
 // when the main window is resized (while remaining freely draggable,
 // collapsible, and closable).
 void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
-    if (!app.lbmRunning.load(std::memory_order_relaxed) || !app.showProcessingWindow) return;
+    bool running = app.lbmRunning.load(std::memory_order_relaxed);
+    bool diverged = app.lbmFlowDivergedAtomic.load(std::memory_order_relaxed);
+    if ((!running && !diverged) || !app.showProcessingWindow) return;
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     constexpr float kRightMargin = 20.0f;
@@ -3337,21 +3420,36 @@ void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
     }
 
     if (expanded) {
-        ImGui::TextUnformatted("Solver running...");
-        ImGui::Text("Step %d", app.lbmStepCount.load(std::memory_order_relaxed));
+        if (diverged) {
+            ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.35f, 1.0f),
+                               running ? "SOLVER DIVERGED (NaN)" : "SOLVER DIVERGED (NaN) — Auto-Paused");
+            ImGui::Text("Failed around Step %d", app.lbmDivergedAtStepAtomic.load(std::memory_order_relaxed));
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.95f, 1.0f), "Purple/magenta cells indicate NaN / blowup.");
+            bool busy = app.taskKind.load(std::memory_order_acquire) != TaskKind::None;
+            ImGui::BeginDisabled(busy);
+            if (ImGui::Button("Stabilize & Reset Solver", ImVec2(220.0f, 0.0f))) {
+                StabilizeAndResetSolver(app);
+            }
+            ImGui::EndDisabled();
+            if (running) ImGui::Separator();
+        }
+        if (running) {
+            ImGui::TextUnformatted("Solver running...");
+            ImGui::Text("Step %d", app.lbmStepCount.load(std::memory_order_relaxed));
 
-        // The current frame's batch of substeps (see AppState::lbmStepProgress's
-        // comment) — particularly worth having on the CPU backend, where one
-        // substep alone can take seconds to minutes, so without this the
-        // window could only say "running" with no sense of whether the step
-        // already in flight is 10% or 90% done.
-        float stepFraction = std::clamp(app.lbmStepProgress.load(std::memory_order_relaxed), 0.0f, 1.0f);
-        char stepLabel[16];
-        std::snprintf(stepLabel, sizeof(stepLabel), "%.0f%%", stepFraction * 100.0f);
-        ImGui::ProgressBar(stepFraction, ImVec2(220.0f, 0.0f), stepLabel);
+            // The current frame's batch of substeps (see AppState::lbmStepProgress's
+            // comment) — particularly worth having on the CPU backend, where one
+            // substep alone can take seconds to minutes, so without this the
+            // window could only say "running" with no sense of whether the step
+            // already in flight is 10% or 90% done.
+            float stepFraction = std::clamp(app.lbmStepProgress.load(std::memory_order_relaxed), 0.0f, 1.0f);
+            char stepLabel[16];
+            std::snprintf(stepLabel, sizeof(stepLabel), "%.0f%%", stepFraction * 100.0f);
+            ImGui::ProgressBar(stepFraction, ImVec2(220.0f, 0.0f), stepLabel);
 
-        float elapsedSeconds = static_cast<float>(SDL_GetTicks() - app.lbmRunStartTicks) / 1000.0f;
-        ImGui::Text("%.1fs since Run", elapsedSeconds);
+            float elapsedSeconds = static_cast<float>(SDL_GetTicks() - app.lbmRunStartTicks) / 1000.0f;
+            ImGui::Text("%.1fs since Run", elapsedSeconds);
+        }
 
         // Nested: the overlay-rebuild task specifically (the only TaskKind
         // that can be in flight *while* lbmRunning is true — Voxelizing/
@@ -3371,6 +3469,62 @@ void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
         }
     }
     ImGui::End();
+}
+
+// Prominent top-center viewport alert banner shown whenever the solver
+// diverges (NaN / Inf / negative density / supersonic lattice blowup,
+// which renders as purple/magenta cells in the overlay).
+void DrawFlowDivergenceBanner(AppState& app, float topInset, bool busy) {
+    bool hasFailure = app.lbmValid.load(std::memory_order_relaxed) &&
+                      (app.lbmFlowDivergedAtomic.load(std::memory_order_relaxed) || app.overlayHasNaN ||
+                       app.lbmStatsHasNaNAtomic.load(std::memory_order_relaxed));
+    if (!hasFailure || app.divergenceBannerDismissedAtomic.load(std::memory_order_relaxed)) return;
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f, viewport->Pos.y + topInset + 14.0f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f, 0.0f), ImVec2(580.0f, 300.0f));
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.24f, 0.05f, 0.14f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.2f, 0.65f, 0.95f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##FlowDivergenceAlert", nullptr, flags)) {
+        int failedStep = app.lbmDivergedAtStepAtomic.load(std::memory_order_relaxed);
+        if (failedStep <= 0) failedStep = app.lbmStepCount.load(std::memory_order_relaxed);
+        bool paused = !app.lbmRunning.load(std::memory_order_relaxed);
+
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.55f, 1.0f),
+                           paused ? "FLOW SOLVER DIVERGED (NaN / Instability) — Auto-Paused at Step %d"
+                                  : "FLOW SOLVER DIVERGED (NaN / Instability) at Step %d",
+                           failedStep);
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "Calculations encountered numerical blowup (NaN / Inf or supersonic lattice speeds), which renders as "
+            "purple/magenta cells. At high resolutions, lower cell size reduces lattice viscosity (tau -> 0.5) and "
+            "requires sub-grid turbulence damping (Smagorinsky Cs >= 0.18) or a slightly higher Tau.");
+        ImGui::Spacing();
+
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Stabilize (Boost Cs & Tau) + Reset Solver")) {
+            StabilizeAndResetSolver(app);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Solver Only")) {
+            StartInitSolverTask(app);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Dismiss")) {
+            app.divergenceBannerDismissedAtomic.store(true, std::memory_order_relaxed);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
 }
 
 // Vector icons drawn procedurally via ImDrawList for the Autodesk Fusion–style
@@ -3773,6 +3927,9 @@ void TriggerRefreshStats(AppState& app) {
         app.lbmLastStats.liftBaseZ = aero.liftArrowBase.z;
     }
     SyncLbmStatsAtomics(app);
+    if (app.lbmLastStats.hasNaN) {
+        FlagFlowDivergence(app);
+    }
 }
 
 // Autodesk Fusion–style top bar: workspace stage tabs along the top strip
@@ -4185,10 +4342,10 @@ void DrawTelemetryHud(AppState& app, float topInset) {
                             LatticeSpeedToMmPerSecond(app, statsCopy.maxSpeed));
                 ImGui::Text("Density: avg %.4f  [%.4f, %.4f]", statsCopy.avgDensity, statsCopy.minDensity,
                             statsCopy.maxDensity);
-                if (statsCopy.hasNaN) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                                        "NaN detected — solver diverged. Try raising tau.");
-                }
+            }
+            if (statsCopy.hasNaN || app.lbmFlowDivergedAtomic.load(std::memory_order_relaxed) || app.overlayHasNaN) {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.45f, 1.0f),
+                                    "FLOW DIVERGED (NaN / purple cells) — raise Smagorinsky Cs or Tau.");
             }
 
             if (app.lbmForcesValidAtomic.load(std::memory_order_relaxed)) {
@@ -4571,6 +4728,16 @@ void DrawFusionInspector(AppState& app, bool busy) {
                     }
                 } else {
                     ImGui::Checkbox("Build overlay on Run", &app.buildOverlayOnRun);
+                    if (ImGui::Checkbox("Auto-pause on flow divergence (NaN)", &app.autoPauseOnDivergence)) {
+                        app.autoPauseOnDivergenceAtomic.store(app.autoPauseOnDivergence, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Periodically probes the solver field for NaN, Inf, negative\n"
+                            "density, or supersonic lattice blowup (purple/magenta cells)\n"
+                            "and immediately pauses the run so high-resolution simulations\n"
+                            "don't waste time stepping a failed calculation.");
+                    }
                     ImGui::BeginDisabled(busy);
                     if (ImGui::Button(app.lbmRunning ? "Pause" : "Run", ImVec2(80.0f, 0.0f))) {
                         bool startingRun = !app.lbmRunning;
@@ -4875,6 +5042,7 @@ void DrawUI(AppState& app) {
         }
         DrawBusyOverlay(app);
         DrawProcessingWindow(app, kFusionRibbonHeight);
+        DrawFlowDivergenceBanner(app, kFusionRibbonHeight, busy);
         return;
     }
 
@@ -5593,9 +5761,11 @@ void DrawUI(AppState& app) {
                         "Overlay (same as the button below) instead of leaving\n"
                         "the overlay empty/stale until a separate manual click.");
                 }
+                if (ImGui::Checkbox("Auto-pause on flow divergence (NaN)", &app.autoPauseOnDivergence)) {
+                    app.autoPauseOnDivergenceAtomic.store(app.autoPauseOnDivergence, std::memory_order_relaxed);
+                }
 
                 ImGui::BeginDisabled(busy);
-                ImGui::SameLine();
                 if (ImGui::Button(app.lbmRunning ? "Pause" : "Run")) {
                     bool startingRun = !app.lbmRunning;
                     app.lbmRunning = !app.lbmRunning;
@@ -5659,12 +5829,12 @@ void DrawUI(AppState& app) {
                     ImGui::Text("Speed: avg %.0f mm/s   max %.0f mm/s",
                                 LatticeSpeedToMmPerSecond(app, statsCopy.avgSpeed),
                                 LatticeSpeedToMmPerSecond(app, statsCopy.maxSpeed));
-                    if (statsCopy.hasNaN) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                                            "NaN detected — solver diverged. Try raising tau.");
-                    }
                 } else {
                     ImGui::TextDisabled("Press \"Refresh Stats\" to read back diagnostics.");
+                }
+                if (statsCopy.hasNaN || app.lbmFlowDivergedAtomic.load(std::memory_order_relaxed) || app.overlayHasNaN) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.45f, 1.0f),
+                                        "FLOW DIVERGED (NaN / purple cells) — raise Smagorinsky Cs or Tau.");
                 }
 
                 // Real-time Lift, Drag & Peak Surface Stress readout
@@ -6230,6 +6400,7 @@ void DrawUI(AppState& app) {
     }
     DrawBusyOverlay(app);
     DrawProcessingWindow(app);
+    DrawFlowDivergenceBanner(app, 0.0f, busy);
 }
 
 }  // namespace
