@@ -71,6 +71,10 @@ else()
     list(APPEND FC_SOURCES ${FC_DIR}/FileDialog_SDL.cpp)
 endif()
 
+if(WIN32)
+    list(APPEND FC_SOURCES ${FC_DIR}/Assets/FlowCraft.rc)
+endif()
+
 add_executable(FlowCraft ${FC_SOURCES})
 target_include_directories(FlowCraft PRIVATE ${FC_DIR} ${IMGUI_DIR})
 target_link_libraries(FlowCraft PRIVATE SDL3::SDL3)
