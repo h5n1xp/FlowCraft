@@ -10,7 +10,12 @@ Despite (or perhaps because of) my lack of experience in this subject I decided 
 FlowCraft allows you to load any 3D object (in STL format), and then using the Lattice Boltzmann Method (D3Q19 and D3Q15) be able to visualise in realtime (as your machine allows) the fluid flow around that object.<br> The computation can run on your GPU or CPU, but you will need a very powerful machine either way. The GPU backend tends to run faster, but quickly becomes limited by the memory available to the GPU. If your machine is lacking resources, I've included a Panel Method backend (and also a Potential Flow solver, if you really really don't have much computing power), which is less computationally expensive, but isn't accurate...
 My relatively old MacStudio Ultra can run the LBM GPU visualisation for 220 million cell lattice at around 1 frame per second.
 
-Due to the large RAM and compute resources required for CFD, I'm not sure how useful this really is as a desktop application but it is fun.
+Due to the large RAM and compute resources required for CFD, I'm not sure how useful this really is as a desktop application but it is fun.<br><br>
+<b>How accurate is this?</b> I don't know, I'm not an aerodynamicist, and I'm extremely new the Navier–Stokes equations.<br>
+<b>Can I use it to test my now Airbus A380 killer?</b> I don't know, I'm not an aerodynamicist, but given how much Compute and RAM resources are required to process a small 1000mm model (the flow doesn't really stabilise until around 1000 steps), I'd guess, probably not.<br>
+<b>Why didn't you include x, y, and z features and make this actually useful?</b> I don't know, I'm not an aerodynamicist. I just wanted to see some pretty 3D animations of fluid flows around my CAD models using my desktop computer.<br><br>
+
+For more serious aero-modelling work, I would suggest using the [XFLR5 application](https://www.flow5.tech/xflr5/xflr5.html), but sadly it looks like that project ended in June  2026.
 
 Several visualisations are available; "smoke" trails, colour map (pressure/speed), Iso-Surface, and voxel space.
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
