@@ -47,6 +47,7 @@
 #include "STLLoader.h"
 #include "VoxelGrid.h"
 #include "Voxelizer.h"
+#include <implot.h>
 
 namespace {
 
@@ -808,6 +809,18 @@ struct AppState {
     // user's last drag — see DrawProcessingWindow. Unused until then.
     float processingWindowRightInset = 0.0f;
     bool classicSinglePanelUI = false;
+
+    // Aero Polars window state (XFLR5-style multi-point polar generation & graphing)
+    bool showAeroPolarsWindow = false;
+    float polarAlphaMin = -4.0f;
+    float polarAlphaMax = 14.0f;
+    float polarAlphaStep = 1.0f;
+    bool polarAutoRefGeometry = true;
+    float polarRefAreaM2 = 0.0f;
+    float polarRefChordM = 0.0f;
+    PanelSolver::PolarSweepResult polarResult;
+    std::string polarExportStatus;
+
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
     // 2 = Amiga (AmigaOS 1.3 window borders, gadgets, Topaz font, and 4-color palette).
     int uiThemeIndex = 0;
@@ -3722,6 +3735,209 @@ void DrawFlowDivergenceBanner(AppState& app, float topInset, bool busy) {
     ImGui::PopStyleColor(2);
 }
 
+// Interactive Aero Polars Window: runs multi-point angle-of-attack sweeps
+// using the 3D Lifting Panel Method and plots CL vs Alpha, CD vs CL, L/D vs Alpha,
+// and CM vs Alpha using ImPlot (replacing XFLR5-style polar generation).
+void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
+    if (!app.showAeroPolarsWindow) return;
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowSize(ImVec2(880.0f, 620.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + 80.0f, viewport->Pos.y + topInset + 20.0f), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Aero Polars & Flight Envelopes (XFLR5-Style)", &app.showAeroPolarsWindow)) {
+        if (!app.meshLoaded || !app.voxelGridValid) {
+            ImGui::TextDisabled("Load a 3D model and Voxelize it first to generate aerodynamic polars.");
+            ImGui::End();
+            return;
+        }
+
+        ImGui::TextColored(ImVec4(0.35f, 0.82f, 1.0f, 1.0f), "Polar Sweep (3D Lifting Panel Method)");
+        ImGui::Spacing();
+
+        ImGui::PushItemWidth(110.0f);
+        ImGui::DragFloat("Min AoA", &app.polarAlphaMin, 0.5f, -20.0f, app.polarAlphaMax, "%.1f deg");
+        ImGui::SameLine();
+        ImGui::DragFloat("Max AoA", &app.polarAlphaMax, 0.5f, app.polarAlphaMin, 35.0f, "%.1f deg");
+        ImGui::SameLine();
+        ImGui::DragFloat("Step", &app.polarAlphaStep, 0.25f, 0.25f, 5.0f, "%.2f deg");
+        ImGui::PopItemWidth();
+
+        ImGui::SameLine(0.0f, 18.0f);
+        bool busy = app.taskKind.load(std::memory_order_acquire) != TaskKind::None;
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Run Polar Sweep", ImVec2(150.0f, 0.0f))) {
+            if (!app.panelSolver.NumPanels() && app.voxelGridValid) {
+                PanelSolver::Params pParams{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow};
+                app.panelSolver.Init(app.gpuDevice, false, app.voxelGrid, pParams);
+            }
+            float refArea = app.polarAutoRefGeometry ? 0.0f : app.polarRefAreaM2;
+            float refChord = app.polarAutoRefGeometry ? 0.0f : app.polarRefChordM;
+            app.polarResult = app.panelSolver.RunPolarSweep(
+                app.polarAlphaMin, app.polarAlphaMax, app.polarAlphaStep,
+                app.lbmInletVelocityMmPerS, app.voxelGrid.cellSize,
+                refArea, refChord);
+            if (app.polarAutoRefGeometry && app.polarResult.valid) {
+                app.polarRefAreaM2 = app.polarResult.refAreaM2;
+                app.polarRefChordM = app.polarResult.refChordM;
+            }
+        }
+        ImGui::EndDisabled();
+
+        ImGui::Checkbox("Auto-compute Reference Geometry", &app.polarAutoRefGeometry);
+        if (!app.polarAutoRefGeometry) {
+            ImGui::SameLine();
+            ImGui::PushItemWidth(110.0f);
+            ImGui::DragFloat("Ref Area S (m2)", &app.polarRefAreaM2, 0.001f, 0.0001f, 100.0f, "%.4f");
+            ImGui::SameLine();
+            ImGui::DragFloat("Ref Chord c (m)", &app.polarRefChordM, 0.001f, 0.0001f, 10.0f, "%.4f");
+            ImGui::PopItemWidth();
+        }
+
+        if (app.polarResult.valid) {
+            ImGui::Separator();
+            const PanelSolver::PolarSweepResult& res = app.polarResult;
+            ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.5f, 1.0f),
+                               "CL_alpha: %.3f /deg (%.2f /rad)  |  alpha_0: %.2f deg  |  (L/D)max: %.1f @ %.1f deg  |  CD0: %.4f  |  e: %.2f  |  AR: %.2f",
+                               res.clAlphaPerDeg, res.clAlphaPerRad, res.alphaZeroLiftDeg,
+                               res.maxLD, res.alphaAtMaxLD, res.minCD0, res.oswaldEfficiency, res.aspectRatio);
+            ImGui::TextDisabled("Ref: S = %.4f m2 (%.1f cm2), Mean Chord = %.1f mm, Span = %.1f mm, Neutral Point X = %.1f mm",
+                                res.refAreaM2, res.refAreaM2 * 10000.0f, res.refChordM * 1000.0f,
+                                res.refSpanM * 1000.0f, res.neutralPointX_mm);
+            ImGui::Spacing();
+
+            size_t n = res.points.size();
+            std::vector<float> alphas(n), cls(n), cds(n), cdis(n), cd0s(n), lds(n), cms(n);
+            std::vector<float> clFitAlphas(n), clFitCls(n);
+            for (size_t i = 0; i < n; ++i) {
+                alphas[i] = res.points[i].alphaDeg;
+                cls[i] = res.points[i].cl;
+                cds[i] = res.points[i].cd;
+                cdis[i] = res.points[i].cdi;
+                cd0s[i] = res.points[i].cd0;
+                lds[i] = res.points[i].ld;
+                cms[i] = res.points[i].cm;
+                clFitAlphas[i] = alphas[i];
+                clFitCls[i] = res.clAlphaPerDeg * (alphas[i] - res.alphaZeroLiftDeg);
+            }
+
+            if (ImGui::BeginTabBar("##AeroPolarTabs")) {
+                if (ImGui::BeginTabItem("Lift & Drag Polar")) {
+                    float availW = ImGui::GetContentRegionAvail().x;
+                    float plotW = std::max(280.0f, (availW - 16.0f) * 0.5f);
+                    float plotH = std::max(280.0f, ImGui::GetContentRegionAvail().y - 10.0f);
+
+                    if (ImPlot::BeginPlot("Lift Curve (CL vs Alpha)", ImVec2(plotW, plotH))) {
+                        ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Lift Coefficient CL");
+                        ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+                        ImPlot::PlotLine("CL (Panel/VLM)", alphas.data(), cls.data(), static_cast<int>(n));
+                        ImPlot::PlotScatter("Data Points", alphas.data(), cls.data(), static_cast<int>(n));
+                        ImPlot::PlotLine("Linear Slope dCL/dAlpha", clFitAlphas.data(), clFitCls.data(), static_cast<int>(n));
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::SameLine();
+                    if (ImPlot::BeginPlot("Drag Polar (CD vs CL)", ImVec2(plotW, plotH))) {
+                        ImPlot::SetupAxes("Total Drag CD", "Lift Coefficient CL");
+                        ImPlot::SetupLegend(ImPlotLocation_SouthEast);
+                        ImPlot::PlotLine("Drag Polar (CD vs CL)", cds.data(), cls.data(), static_cast<int>(n));
+                        ImPlot::PlotScatter("Data Points", cds.data(), cls.data(), static_cast<int>(n));
+                        ImPlot::PlotLine("Induced Drag CDi", cdis.data(), cls.data(), static_cast<int>(n));
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Glide Ratio & Moment")) {
+                    float availW = ImGui::GetContentRegionAvail().x;
+                    float plotW = std::max(280.0f, (availW - 16.0f) * 0.5f);
+                    float plotH = std::max(280.0f, ImGui::GetContentRegionAvail().y - 10.0f);
+
+                    if (ImPlot::BeginPlot("Glide Ratio (L/D vs Alpha)", ImVec2(plotW, plotH))) {
+                        ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Lift-to-Drag Ratio L/D");
+                        ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+                        ImPlot::PlotLine("L/D Ratio", alphas.data(), lds.data(), static_cast<int>(n));
+                        ImPlot::PlotScatter("Points", alphas.data(), lds.data(), static_cast<int>(n));
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::SameLine();
+                    if (ImPlot::BeginPlot("Pitching Moment (CM vs Alpha)", ImVec2(plotW, plotH))) {
+                        ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Pitching Moment CM (c/4)");
+                        ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+                        ImPlot::PlotLine("CM (c/4)", alphas.data(), cms.data(), static_cast<int>(n));
+                        ImPlot::PlotScatter("Points", alphas.data(), cms.data(), static_cast<int>(n));
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Data Table & Export")) {
+                    if (ImGui::Button("Export Polar to CSV (polar.csv)")) {
+                        FILE* f = std::fopen("polar.csv", "w");
+                        if (f) {
+                            std::fprintf(f, "# FlowCraft Aero Polar Sweep (XFLR5-Style)\n");
+                            std::fprintf(f, "# S = %.6f m2, Mean Chord = %.6f m, Span = %.6f m, AR = %.3f\n",
+                                         res.refAreaM2, res.refChordM, res.refSpanM, res.aspectRatio);
+                            std::fprintf(f, "# CL_alpha = %.4f /deg, alpha_0 = %.3f deg, max(L/D) = %.2f @ %.1f deg\n",
+                                         res.clAlphaPerDeg, res.alphaZeroLiftDeg, res.maxLD, res.alphaAtMaxLD);
+                            std::fprintf(f, "Alpha_deg,CL,CD,CDi,CD0,L_over_D,CM_c4,Lift_N,Drag_N,CoP_X_mm\n");
+                            for (const auto& pt : res.points) {
+                                std::fprintf(f, "%.2f,%.5f,%.5f,%.5f,%.5f,%.3f,%.5f,%.4f,%.4f,%.2f\n",
+                                             pt.alphaDeg, pt.cl, pt.cd, pt.cdi, pt.cd0, pt.ld, pt.cm,
+                                             pt.liftN, pt.dragN, pt.cpX_mm);
+                            }
+                            std::fclose(f);
+                            app.polarExportStatus = "Exported polar.csv successfully!";
+                        } else {
+                            app.polarExportStatus = "Failed to write polar.csv";
+                        }
+                    }
+                    if (!app.polarExportStatus.empty()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "%s", app.polarExportStatus.c_str());
+                    }
+
+                    if (ImGui::BeginTable("##PolarDataTable", 10,
+                                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                                          ImVec2(0.0f, 320.0f))) {
+                        ImGui::TableSetupColumn("AoA (deg)");
+                        ImGui::TableSetupColumn("CL");
+                        ImGui::TableSetupColumn("CD");
+                        ImGui::TableSetupColumn("CDi");
+                        ImGui::TableSetupColumn("CD0");
+                        ImGui::TableSetupColumn("L/D");
+                        ImGui::TableSetupColumn("CM");
+                        ImGui::TableSetupColumn("Lift (N)");
+                        ImGui::TableSetupColumn("Drag (N)");
+                        ImGui::TableSetupColumn("CoP X (mm)");
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& pt : res.points) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0); ImGui::Text("%.1f deg", pt.alphaDeg);
+                            ImGui::TableSetColumnIndex(1); ImGui::Text("%.4f", pt.cl);
+                            ImGui::TableSetColumnIndex(2); ImGui::Text("%.4f", pt.cd);
+                            ImGui::TableSetColumnIndex(3); ImGui::Text("%.4f", pt.cdi);
+                            ImGui::TableSetColumnIndex(4); ImGui::Text("%.4f", pt.cd0);
+                            ImGui::TableSetColumnIndex(5); ImGui::Text("%.2f", pt.ld);
+                            ImGui::TableSetColumnIndex(6); ImGui::Text("%.4f", pt.cm);
+                            ImGui::TableSetColumnIndex(7); ImGui::Text("%.3f", pt.liftN);
+                            ImGui::TableSetColumnIndex(8); ImGui::Text("%.3f", pt.dragN);
+                            ImGui::TableSetColumnIndex(9); ImGui::Text("%.1f", pt.cpX_mm);
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+        } else {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Click \"Run Polar Sweep\" above to calculate lift, drag, efficiency curves and stability derivatives.");
+        }
+    }
+    ImGui::End();
+}
+
 // Vector icons drawn procedurally via ImDrawList for the Autodesk Fusion–style
 // top ribbon toolbar — crisp at any DPI with zero external image assets.
 enum class RibbonIcon {
@@ -3748,7 +3964,8 @@ enum class RibbonIcon {
     StyleParticles,
     StyleStress,
     StyleIso,
-    StyleRaymarch
+    StyleRaymarch,
+    AeroPolars
 };
 
 void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIcon icon, ImU32 primaryCol,
@@ -3990,6 +4207,21 @@ void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIco
                 ImU32 col = (i == 0) ? accentCol : IM_COL32(80, 185, 235, 140 + i * 25);
                 dl->AddLine(ImVec2(center.x - halfW, y), ImVec2(center.x + halfW, y), col, 2.0f);
             }
+            break;
+        }
+        case RibbonIcon::AeroPolars: {
+            // Coordinate axes + lifting curve
+            ImVec2 o{center.x - r * 0.7f, center.y + r * 0.7f};
+            ImVec2 x{center.x + r * 0.8f, center.y + r * 0.7f};
+            ImVec2 y{center.x - r * 0.7f, center.y - r * 0.8f};
+            dl->AddLine(o, x, primaryCol, 1.6f);
+            dl->AddLine(o, y, primaryCol, 1.6f);
+            // Curved aero lift line (C_L vs alpha curve)
+            ImVec2 p0{center.x - r * 0.5f, center.y + r * 0.55f};
+            ImVec2 p1{center.x - r * 0.1f, center.y + r * 0.1f};
+            ImVec2 p2{center.x + r * 0.35f, center.y - r * 0.45f};
+            ImVec2 p3{center.x + r * 0.75f, center.y - r * 0.40f};
+            dl->AddBezierCubic(p0, p1, p2, p3, accentCol, 2.0f);
             break;
         }
     }
@@ -4358,6 +4590,11 @@ void DrawFusionRibbon(AppState& app, bool busy) {
         if (RibbonIconButton("##rib_stats", "Stats", RibbonIcon::RefreshStats, false, !busy && app.lbmValid,
                              "Read back live density, speed, and Lift/Drag aerodynamic forces.", 48.0f)) {
             TriggerRefreshStats(app);
+        }
+        ImGui::SameLine(0.0f, 3.0f);
+        if (RibbonIconButton("##rib_polars", "Polars", RibbonIcon::AeroPolars, app.showAeroPolarsWindow,
+                             app.voxelGridValid, "Aero Polars & Flight Envelopes (XFLR5-style polar sweep).", 52.0f)) {
+            app.showAeroPolarsWindow = !app.showAeroPolarsWindow;
         }
 
         DrawRibbonDivider();
@@ -4961,6 +5198,12 @@ void DrawFusionInspector(AppState& app, bool busy) {
                         TriggerRefreshStats(app);
                     }
                     ImGui::EndDisabled();
+
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.35f, 0.82f, 1.0f, 1.0f), "Aero Polars (XFLR5-Style)");
+                    if (ImGui::Button("Open Aero Polars Window...", ImVec2(220.0f, 0.0f))) {
+                        app.showAeroPolarsWindow = true;
+                    }
                 }
             }
         } else if (app.activeTab == WorkspaceTab::Inspect) {
@@ -5238,6 +5481,7 @@ void DrawUI(AppState& app) {
         DrawBusyOverlay(app);
         DrawProcessingWindow(app, kFusionRibbonHeight);
         DrawFlowDivergenceBanner(app, kFusionRibbonHeight, busy);
+        DrawAeroPolarsWindow(app, kFusionRibbonHeight);
         return;
     }
 
@@ -6080,6 +6324,14 @@ void DrawUI(AppState& app) {
                     }
                 }
 
+                if (ImGui::Button("Aero Polars (XFLR5-Style)...", ImVec2(220.0f, 0.0f))) {
+                    app.showAeroPolarsWindow = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Open interactive XFLR5-style multi-point polar sweeps\n"
+                                      "and flight envelope curves (CL, CD, L/D, CM vs alpha).");
+                }
+
                 ImGui::Separator();
                 ImGui::TextUnformatted("Flow Overlay");
 
@@ -6596,6 +6848,7 @@ void DrawUI(AppState& app) {
     DrawBusyOverlay(app);
     DrawProcessingWindow(app);
     DrawFlowDivergenceBanner(app, 0.0f, busy);
+    DrawAeroPolarsWindow(app);
 }
 
 }  // namespace
@@ -6675,6 +6928,7 @@ int main(int, char**) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();
     ImGui::StyleColorsDark();
 
     {
@@ -7066,6 +7320,7 @@ int main(int, char**) {
     app.panelSolver.Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui_ImplSDLGPU3_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     SDL_ReleaseWindowFromGPUDevice(gpuDevice, window);

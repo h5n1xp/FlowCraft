@@ -1010,3 +1010,239 @@ PanelSolver::Stats PanelSolver::ComputeStatsFromField(const std::vector<float>& 
     }
     return stats;
 }
+
+PanelSolver::PolarSweepResult PanelSolver::RunPolarSweep(float alphaMinDeg, float alphaMaxDeg, float alphaStepDeg,
+                                                        float inletVelocityMmPerS, float cellSizeMm,
+                                                        float refAreaM2, float refChordM,
+                                                        int sweepsPerPoint) {
+    PolarSweepResult result;
+    const size_t P = panels_.size();
+    const size_t W = wakeStrips_.size();
+    if (P == 0 || W == 0) return result;
+
+    if (alphaStepDeg <= 0.01f) alphaStepDeg = 1.0f;
+    if (alphaMaxDeg < alphaMinDeg) std::swap(alphaMinDeg, alphaMaxDeg);
+
+    // Save initial state to restore afterward
+    std::vector<float> savedPanelSigma(P);
+    for (size_t i = 0; i < P; ++i) savedPanelSigma[i] = panels_[i].sigma;
+    std::vector<float> savedWakeGamma(W);
+    for (size_t k = 0; k < W; ++k) savedWakeGamma[k] = wakeStrips_[k].gamma;
+
+    // Reference geometry calculation if not explicitly provided
+    float yMin = 1e30f, yMax = -1e30f;
+    float xMin = 1e30f, xMax = -1e30f;
+    float sumAreaLat = 0.0f;
+    for (size_t s = 0; s < W; ++s) {
+        yMin = std::min({yMin, wakeStrips_[s].boundA.y, wakeStrips_[s].boundB.y});
+        yMax = std::max({yMax, wakeStrips_[s].boundA.y, wakeStrips_[s].boundB.y});
+        xMin = std::min({xMin, wakeStrips_[s].boundA.x, wakeStrips_[s].boundB.x});
+        xMax = std::max({xMax, wakeStrips_[s].boundA.x, wakeStrips_[s].boundB.x});
+        sumAreaLat += wakeStrips_[s].chord * wakeStrips_[s].span;
+    }
+    float spanLat = std::max(1.0f, yMax - yMin);
+    float meanChordLat = (spanLat > 0.0f) ? (sumAreaLat / spanLat) : 1.0f;
+    float mPerCell = cellSizeMm * 1e-3f;
+
+    if (refAreaM2 <= 0.0f) {
+        refAreaM2 = sumAreaLat * (mPerCell * mPerCell);
+    }
+    if (refChordM <= 0.0f) {
+        refChordM = meanChordLat * mPerCell;
+    }
+    float refSpanM = spanLat * mPerCell;
+    float AR = (refAreaM2 > 1e-6f) ? ((refSpanM * refSpanM) / refAreaM2) : 1.0f;
+    result.refAreaM2 = refAreaM2;
+    result.refChordM = refChordM;
+    result.refSpanM = refSpanM;
+    result.aspectRatio = AR;
+
+    // Aerodynamic scaling constants
+    constexpr float kRhoAir = 1.225f;
+    float vInf = std::max(0.1f, inletVelocityMmPerS * 1e-3f);
+    float qInf = 0.5f * kRhoAir * vInf * vInf;
+    float cu = vInf / std::max(1e-4f, params_.inletVelocity);
+    float forceFactor = kRhoAir * cu * cu * (mPerCell * mPerCell);
+
+    const float flowSign = params_.reverseFlow ? -1.0f : 1.0f;
+    const float wakeLen = 8.0f * static_cast<float>(std::max({nx_, ny_, nz_, 64}));
+    const Vec3 wakeOffset{flowSign * wakeLen, 0.0f, 0.0f};
+    constexpr float kRelaxPanel = 0.65f;
+    constexpr float kRelaxWake = 0.55f;
+
+    // Reference quarter-chord point along flow axis
+    float refChordQuarterX = xMin + 0.25f * (xMax - xMin);
+
+    int numPoints = static_cast<int>(std::floor((alphaMaxDeg - alphaMinDeg) / alphaStepDeg + 0.5f)) + 1;
+    result.points.reserve(numPoints);
+
+    for (int pIdx = 0; pIdx < numPoints; ++pIdx) {
+        float alpha = alphaMinDeg + static_cast<float>(pIdx) * alphaStepDeg;
+        float alphaRad = alpha * (kPi / 180.0f);
+
+        float cosA = std::cos(alphaRad);
+        float sinA = std::sin(alphaRad);
+        // Flow velocity vector with angle of attack
+        Vec3 uInf{flowSign * params_.inletVelocity * cosA, 0.0f, params_.inletVelocity * sinA};
+
+        // Solve Gauss-Seidel for this onset flow
+        int iters = std::max(1, sweepsPerPoint);
+        for (int iter = 0; iter < iters; ++iter) {
+            for (size_t i = 0; i < P; ++i) {
+                float rhs = -Dot(uInf, panels_[i].normal);
+                const float* rowP = &panelToPanel_[i * P];
+                for (size_t j = 0; j < P; ++j) {
+                    if (j == i) continue;
+                    rhs -= rowP[j] * panels_[j].sigma;
+                }
+                float maxQ = 0.5f * params_.inletVelocity * panels_[i].area;
+                float targetQ = std::clamp(rhs / panels_[i].selfDiag, -maxQ, maxQ);
+                panels_[i].sigma += kRelaxPanel * (targetQ - panels_[i].sigma);
+            }
+
+            for (size_t k = 0; k < W; ++k) {
+                float rhs = -Dot(uInf, wakeStrips_[k].camberNormal);
+                const float* rowP = &panelToWake_[k * P];
+                for (size_t j = 0; j < P; ++j) {
+                    rhs -= rowP[j] * panels_[j].sigma;
+                }
+                const float* rowW = &wakeToWake_[k * W];
+                for (size_t s = 0; s < W; ++s) {
+                    if (s == k) continue;
+                    rhs -= rowW[s] * wakeStrips_[s].gamma;
+                }
+                float targetG = rhs / wakeStrips_[k].selfDiag;
+                float leftG = (k > 0) ? wakeStrips_[k - 1].gamma : 0.0f;
+                float rightG = (k + 1 < W) ? wakeStrips_[k + 1].gamma : 0.0f;
+                targetG = 0.80f * targetG + 0.10f * (leftG + rightG);
+                float maxGamma = 0.14f * params_.inletVelocity * wakeStrips_[k].chord;
+                targetG = std::clamp(targetG, -maxGamma, maxGamma);
+                wakeStrips_[k].gamma += kRelaxWake * (targetG - wakeStrips_[k].gamma);
+            }
+        }
+
+        // 1. Total Lift (Kutta-Joukowski on bound vortex line)
+        float liftLatSum = 0.0f;
+        float liftWeightX = 0.0f;
+        float momentLatSum = 0.0f;
+        for (size_t s = 0; s < W; ++s) {
+            float gamma = wakeStrips_[s].gamma * kFourPi;
+            float stripLift = gamma * wakeStrips_[s].span * params_.inletVelocity * cosA;
+            liftLatSum += stripLift;
+            float boundX = 0.5f * (wakeStrips_[s].boundA.x + wakeStrips_[s].boundB.x);
+            liftWeightX += stripLift * boundX;
+            // Pitching moment about reference quarter-chord (pitch-up positive)
+            momentLatSum += stripLift * (boundX - refChordQuarterX);
+        }
+
+        // 2. Induced Drag (Trefftz-plane downwash)
+        float inducedDragLatSum = 0.0f;
+        for (size_t s = 0; s < W; ++s) {
+            const WakeStrip& ws = wakeStrips_[s];
+            Vec3 mid = (ws.boundA + ws.boundB) * 0.5f;
+            float downwashZ = 0.0f;
+            for (size_t j = 0; j < W; ++j) {
+                const Vec3& A = wakeStrips_[j].boundA;
+                const Vec3& B = wakeStrips_[j].boundB;
+                Vec3 Awake = A + wakeOffset;
+                Vec3 Bwake = B + wakeOffset;
+                float coreSq = wakeStrips_[j].coreSq;
+                Vec3 uTrail = VortexSegmentUnitCPU(mid, Awake, A, coreSq) +
+                              VortexSegmentUnitCPU(mid, B, Bwake, coreSq);
+                downwashZ += uTrail.z * wakeStrips_[j].gamma;
+            }
+            float gamma = ws.gamma * kFourPi;
+            inducedDragLatSum += std::fabs(gamma * downwashZ) * ws.span;
+        }
+
+        float liftN = liftLatSum * forceFactor;
+        float indDragN = inducedDragLatSum * forceFactor;
+
+        // Baseline profile drag: calibrated skin friction + form drag
+        float cd0 = 0.012f + 0.003f * (1.0f - cosA);
+        float profileDragN = cd0 * qInf * refAreaM2;
+        float totalDragN = indDragN + profileDragN;
+        float momentNm = momentLatSum * forceFactor * mPerCell;
+
+        float qS = std::max(1e-6f, qInf * refAreaM2);
+        float cl = liftN / qS;
+        float cd = totalDragN / qS;
+        float cdi = indDragN / qS;
+        float cm = momentNm / (qS * std::max(1e-4f, refChordM));
+        float ld = (cd > 1e-6f) ? (cl / cd) : 0.0f;
+        float cpX = (std::fabs(liftLatSum) > 1e-4f) ? ((liftWeightX / liftLatSum) * mPerCell * 1e3f) : (refChordQuarterX * mPerCell * 1e3f);
+
+        PolarPoint pt;
+        pt.alphaDeg = alpha;
+        pt.cl = cl;
+        pt.cd = cd;
+        pt.cdi = cdi;
+        pt.cd0 = cd0;
+        pt.cm = cm;
+        pt.ld = ld;
+        pt.liftN = liftN;
+        pt.dragN = totalDragN;
+        pt.cpX_mm = cpX;
+        result.points.push_back(pt);
+    }
+
+    // Restore saved state
+    for (size_t i = 0; i < P; ++i) panels_[i].sigma = savedPanelSigma[i];
+    for (size_t k = 0; k < W; ++k) wakeStrips_[k].gamma = savedWakeGamma[k];
+
+    // Compute curve summaries: linear regression on CL(alpha) in linear range [-2..+8 deg]
+    if (result.points.size() >= 2) {
+        float sumX = 0.0f, sumY = 0.0f, sumXY = 0.0f, sumX2 = 0.0f;
+        int count = 0;
+        float maxLD = -1e30f;
+        float alphaAtMax = 0.0f;
+        float minCD0 = 1e30f;
+        float oswaldSum = 0.0f;
+        int oswaldCount = 0;
+
+        for (const PolarPoint& pt : result.points) {
+            if (pt.ld > maxLD) {
+                maxLD = pt.ld;
+                alphaAtMax = pt.alphaDeg;
+            }
+            minCD0 = std::min(minCD0, pt.cd0);
+
+            // Fit in linear lift range
+            if (pt.alphaDeg >= -2.0f && pt.alphaDeg <= 8.0f) {
+                sumX += pt.alphaDeg;
+                sumY += pt.cl;
+                sumXY += pt.alphaDeg * pt.cl;
+                sumX2 += pt.alphaDeg * pt.alphaDeg;
+                ++count;
+            }
+
+            if (std::fabs(pt.cl) > 0.15f && pt.cdi > 1e-5f) {
+                float e = (pt.cl * pt.cl) / (kPi * AR * pt.cdi);
+                if (e >= 0.2f && e <= 1.2f) {
+                    oswaldSum += e;
+                    ++oswaldCount;
+                }
+            }
+        }
+
+        if (count >= 2) {
+            float n = static_cast<float>(count);
+            float denom = n * sumX2 - sumX * sumX;
+            if (std::fabs(denom) > 1e-6f) {
+                float slope = (n * sumXY - sumX * sumY) / denom;
+                float intercept = (sumY - slope * sumX) / n;
+                result.clAlphaPerDeg = slope;
+                result.clAlphaPerRad = slope * (180.0f / kPi);
+                result.alphaZeroLiftDeg = (std::fabs(slope) > 1e-5f) ? (-intercept / slope) : 0.0f;
+            }
+        }
+        result.maxLD = maxLD;
+        result.alphaAtMaxLD = alphaAtMax;
+        result.minCD0 = minCD0;
+        result.oswaldEfficiency = (oswaldCount > 0) ? (oswaldSum / static_cast<float>(oswaldCount)) : 0.85f;
+        result.neutralPointX_mm = (refChordQuarterX * mPerCell * 1e3f);
+        result.valid = true;
+    }
+
+    return result;
+}

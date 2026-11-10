@@ -41,6 +41,7 @@ endif()
 
 set(FC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/FlowCraft)
 set(IMGUI_DIR ${FC_DIR}/ThirdParty/imgui)
+set(IMPLOT_DIR ${FC_DIR}/ThirdParty/implot)
 
 set(FC_SOURCES
     ${FC_DIR}/FieldOverlay.cpp
@@ -62,7 +63,10 @@ set(FC_SOURCES
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/imgui_impl_sdl3.cpp
-    ${IMGUI_DIR}/imgui_impl_sdlgpu3.cpp)
+    ${IMGUI_DIR}/imgui_impl_sdlgpu3.cpp
+    ${IMPLOT_DIR}/implot.cpp
+    ${IMPLOT_DIR}/implot_items.cpp
+    ${IMPLOT_DIR}/implot_demo.cpp)
 
 # Native Cocoa file dialogs + About menu on macOS; SDL3's own portable dialogs
 # elsewhere (FileDialog_SDL.cpp compiles to nothing on Apple platforms).
@@ -77,7 +81,7 @@ if(WIN32)
 endif()
 
 add_executable(FlowCraft ${FC_SOURCES})
-target_include_directories(FlowCraft PRIVATE ${FC_DIR} ${IMGUI_DIR})
+target_include_directories(FlowCraft PRIVATE ${FC_DIR} ${IMGUI_DIR} ${IMPLOT_DIR})
 target_link_libraries(FlowCraft PRIVATE SDL3::SDL3)
 
 if(WIN32)

@@ -97,6 +97,42 @@ public:
     size_t NumPanels() const { return panels_.size(); }
     size_t NumWakeStrips() const { return wakeStrips_.size(); }
 
+    // Aero Polar Sweep (XFLR5-style multi-point polar generation)
+    struct PolarPoint {
+        float alphaDeg = 0.0f;
+        float cl = 0.0f;
+        float cd = 0.0f;
+        float cdi = 0.0f;
+        float cd0 = 0.0f;
+        float cm = 0.0f;
+        float ld = 0.0f;
+        float liftN = 0.0f;
+        float dragN = 0.0f;
+        float cpX_mm = 0.0f;
+    };
+
+    struct PolarSweepResult {
+        std::vector<PolarPoint> points;
+        float clAlphaPerDeg = 0.0f;
+        float clAlphaPerRad = 0.0f;
+        float alphaZeroLiftDeg = 0.0f;
+        float maxLD = 0.0f;
+        float alphaAtMaxLD = 0.0f;
+        float minCD0 = 0.0f;
+        float oswaldEfficiency = 0.85f;
+        float neutralPointX_mm = 0.0f;
+        float refAreaM2 = 0.0f;
+        float refChordM = 0.0f;
+        float refSpanM = 0.0f;
+        float aspectRatio = 0.0f;
+        bool valid = false;
+    };
+
+    PolarSweepResult RunPolarSweep(float alphaMinDeg, float alphaMaxDeg, float alphaStepDeg,
+                                  float inletVelocityMmPerS, float cellSizeMm,
+                                  float refAreaM2 = 0.0f, float refChordM = 0.0f,
+                                  int sweepsPerPoint = 35);
+
 private:
     struct SurfacePanel {
         Vec3 collocation;   // surface collocation point (on the SDF zero-isosurface)
