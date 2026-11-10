@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		037F94084E28C0A936DD4EC9 /* libSDL3.0.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 9A8EA8D6C5C5C67580B674CB /* libSDL3.0.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		2284AAFCF53F8783E0CCE403 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 55E58F98BAB60613120DB1F1 /* Cocoa.framework */; };
+		A1C0FFEE10C17B00D0000001 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1C0FFEE10C17B00D0000002 /* IOKit.framework */; };
 		847719757F2F87543F0D638F /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 70CD0591268888BA097BA797 /* UniformTypeIdentifiers.framework */; };
 		B2F16A02C065D5A5ABD83C58 /* libSDL3.0.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 9A8EA8D6C5C5C67580B674CB /* libSDL3.0.dylib */; };
 /* End PBXBuildFile section */
@@ -38,6 +39,7 @@
 
 /* Begin PBXFileReference section */
 		55E58F98BAB60613120DB1F1 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
+		A1C0FFEE10C17B00D0000002 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		70CD0591268888BA097BA797 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
 		9A8EA8D6C5C5C67580B674CB /* libSDL3.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libSDL3.0.dylib; path = /opt/homebrew/lib/libSDL3.0.dylib; sourceTree = "<absolute>"; };
 		C90F62343099DBBD00135959 /* FlowCraft */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = FlowCraft; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -58,6 +60,7 @@
 			files = (
 				B2F16A02C065D5A5ABD83C58 /* libSDL3.0.dylib in Frameworks */,
 				2284AAFCF53F8783E0CCE403 /* Cocoa.framework in Frameworks */,
+				A1C0FFEE10C17B00D0000001 /* IOKit.framework in Frameworks */,
 				847719757F2F87543F0D638F /* UniformTypeIdentifiers.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -70,6 +73,7 @@
 			children = (
 				9A8EA8D6C5C5C67580B674CB /* libSDL3.0.dylib */,
 				55E58F98BAB60613120DB1F1 /* Cocoa.framework */,
+				A1C0FFEE10C17B00D0000002 /* IOKit.framework */,
 				70CD0591268888BA097BA797 /* UniformTypeIdentifiers.framework */,
 			);
 			name = Frameworks;

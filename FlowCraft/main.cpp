@@ -43,6 +43,7 @@
 #include "Renderer.h"
 #include "SessionFile.h"
 #include "SmokeTrail.h"
+#include "SystemMeters.h"
 #include "STLLoader.h"
 #include "VoxelGrid.h"
 #include "Voxelizer.h"
@@ -538,11 +539,11 @@ struct AppState {
 
     // 3D Iso-surface extraction via Marching Cubes (FieldOverlay::BuildIsoSurfaceMesh)
     float isoThreshold = 0.35f;       // Normalized threshold [0..1] within field range
-    float isoAlpha = 0.90f;           // Surface opacity (0.1..1.0)
+    float isoAlpha = 0.40f;           // Surface opacity (0.1..1.0)
     bool isoEncloseGreater = false;   // false = enclose <= iso (wake bubble, vortex core), true = >= iso (jet, stagnation)
     int isoStride = 1;                // 1 = full resolution, 2 = 2x downsampled stride
     std::atomic<float> isoThresholdAtomic{0.35f};
-    std::atomic<float> isoAlphaAtomic{0.90f};
+    std::atomic<float> isoAlphaAtomic{0.40f};
     std::atomic<bool> isoEncloseGreaterAtomic{false};
     std::atomic<int> isoStrideAtomic{1};
 
@@ -786,10 +787,26 @@ struct AppState {
     ImVec2 telemetryHudLastPos{0.0f, 0.0f};
     ImVec2 telemetryHudLastViewportSize{0.0f, 0.0f};
     bool showProcessingWindow = true;
+    // The Processing window's performance meters — see UpdatePerfMeters.
+    // UI-thread-only. Rates are differences between two samples taken
+    // kPerfSampleIntervalMs apart, so each field here is either "the
+    // previous sample" (last*) or "the most recently computed rate".
+    struct PerfMeters {
+        Uint64 lastSampleTicks = 0;      // 0 = no previous sample to difference against yet
+        double lastCpuSeconds = -1.0;
+        int lastStepCount = 0;
+        bool ratesValid = false;         // false until two samples exist
+        float cpuCoresInUse = 0.0f;      // this process, all threads: 1.0 = one core fully busy
+        float gpuUtilization = -1.0f;    // whole device, 0..1; negative = not available on this platform
+        float stepsPerSecond = 0.0f;
+    };
+    PerfMeters perfMeters;
     bool processingWindowInitialized = false;
     bool processingWindowUserMoved = false;
     ImVec2 processingWindowLastPos{0.0f, 0.0f};
-    ImVec2 processingWindowLastViewportSize{0.0f, 0.0f};
+    // Gap between the window's right edge and the viewport's, as of the
+    // user's last drag — see DrawProcessingWindow. Unused until then.
+    float processingWindowRightInset = 0.0f;
     bool classicSinglePanelUI = false;
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
     // 2 = Amiga (AmigaOS 1.3 window borders, gadgets, Topaz font, and 4-color palette).
@@ -2862,13 +2879,29 @@ void PollKeyboardRotation(AppState& app, float dt) {
 // seen from the current camera angle, so it's clear how the model (which
 // rotates in place, not the camera) is currently presented to the flow.
 // The flow axis is labelled directly rather than drawn as a separate arrow.
+//
+// Its geometry is named (rather than left as literals in the function)
+// because DrawProcessingWindow parks itself directly underneath by
+// default and needs the same numbers: the widget is a dark backdrop disc
+// of radius kGizmoRadius + kGizmoBackdropPad, centred kGizmoCenterInset in
+// from the viewport's top-right corner (below `topInset`).
+constexpr float kGizmoRadius = 42.0f;
+constexpr float kGizmoBackdropPad = 16.0f;
+constexpr float kGizmoCenterInset = 70.0f;
+// Distance from the top of the widget's area (viewport top + topInset) to
+// the backdrop's bottom edge, and from the viewport's right edge to the
+// backdrop's right edge.
+constexpr float kGizmoBottomInset = kGizmoCenterInset + kGizmoRadius + kGizmoBackdropPad;
+constexpr float kGizmoRightMargin = kGizmoCenterInset - (kGizmoRadius + kGizmoBackdropPad);
+
 void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float radius = 42.0f;
-    const ImVec2 center{viewport->Pos.x + viewport->Size.x - 70.0f, viewport->Pos.y + topInset + 70.0f};
+    const float radius = kGizmoRadius;
+    const ImVec2 center{viewport->Pos.x + viewport->Size.x - kGizmoCenterInset,
+                        viewport->Pos.y + topInset + kGizmoCenterInset};
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    dl->AddCircleFilled(center, radius + 16.0f, IM_COL32(18, 19, 23, 150));
+    dl->AddCircleFilled(center, radius + kGizmoBackdropPad, IM_COL32(18, 19, 23, 150));
 
     OrbitCamera::Basis basis = camera.GetBasis();
     struct AxisDef {
@@ -3434,51 +3467,107 @@ void DrawBusyOverlay(const AppState& app) {
 // below DrawOrientationGizmo, keeping its position relative to the right edge
 // when the main window is resized (while remaining freely draggable,
 // collapsible, and closable).
+// Refreshes app.perfMeters at most every kPerfSampleIntervalMs — called
+// every frame the Processing window is showing a running solver. Half a
+// second is long enough that the CPU-time difference isn't dominated by
+// scheduler granularity (and that the numbers are readable rather than
+// flickering), short enough to still feel live.
+void UpdatePerfMeters(AppState& app) {
+    constexpr Uint64 kPerfSampleIntervalMs = 500;
+    // A gap this long means the window wasn't being drawn (paused, closed,
+    // collapsed) — a rate averaged across it would be meaningless, so the
+    // next sample just starts over.
+    constexpr Uint64 kPerfStaleMs = 3000;
+
+    AppState::PerfMeters& m = app.perfMeters;
+    Uint64 now = SDL_GetTicks();
+    int stepCount = app.lbmStepCount.load(std::memory_order_relaxed);
+    bool restart = m.lastSampleTicks == 0 || now - m.lastSampleTicks > kPerfStaleMs ||
+                   stepCount < m.lastStepCount;  // step count went backwards: the solver was re-initialized
+    if (!restart && now - m.lastSampleTicks < kPerfSampleIntervalMs) return;
+
+    double cpuSeconds = SystemMeters::ProcessCpuSeconds();
+    if (restart) {
+        m.ratesValid = false;
+    } else {
+        double wallSeconds = static_cast<double>(now - m.lastSampleTicks) / 1000.0;
+        m.stepsPerSecond = static_cast<float>(static_cast<double>(stepCount - m.lastStepCount) / wallSeconds);
+        m.cpuCoresInUse = (cpuSeconds >= 0.0 && m.lastCpuSeconds >= 0.0)
+                              ? static_cast<float>(std::max(0.0, cpuSeconds - m.lastCpuSeconds) / wallSeconds)
+                              : -1.0f;
+        m.ratesValid = true;
+    }
+    m.gpuUtilization = SystemMeters::GpuUtilization();  // an instantaneous reading, not a difference
+    m.lastSampleTicks = now;
+    m.lastCpuSeconds = cpuSeconds;
+    m.lastStepCount = stepCount;
+}
+
 void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
     bool running = app.lbmRunning.load(std::memory_order_relaxed);
     bool diverged = app.lbmFlowDivergedAtomic.load(std::memory_order_relaxed);
     if ((!running && !diverged) || !app.showProcessingWindow) return;
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    constexpr float kRightMargin = 20.0f;
-    if (!app.processingWindowInitialized) {
-        ImGui::SetNextWindowPos(
-            ImVec2(viewport->Pos.x + viewport->Size.x - kRightMargin, viewport->Pos.y + topInset + 140.0f),
-            ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
-    }
+    // Default spot: directly under the orientation widget, right edges
+    // lined up. Applied below with SetWindowPos every frame until the user
+    // drags the window, rather than once via SetNextWindowPos — that
+    // one-shot placement used to be silently cancelled by this function's
+    // own SetWindowPos call (which only corrected x) while the
+    // auto-resizing window was still hidden on its first frames, leaving
+    // it at ImGui's stock y and so on top of the widget instead of
+    // under it.
+    constexpr float kRightMargin = kGizmoRightMargin;
+    constexpr float kGapBelowGizmo = 8.0f;
     ImGui::SetNextWindowBgAlpha(0.85f);
     bool expanded = ImGui::Begin("Processing", &app.showProcessingWindow, ImGuiWindowFlags_AlwaysAutoResize);
     {
         ImVec2 currentPos = ImGui::GetWindowPos();
         ImVec2 currentSize = ImGui::GetWindowSize();
+        float viewportRight = viewport->Pos.x + viewport->Size.x;
 
+        // Every position change this function makes itself is recorded in
+        // processingWindowLastPos at the bottom, so a position that
+        // differs from it on the next frame, with the button held on the
+        // focused window, can only be ImGui moving the window for a user
+        // drag. (IsMouseDown, not IsMouseDragging: the latter stays false
+        // for the first few pixels of a drag, during which the code below
+        // would otherwise pull the window back.)
         if (!app.processingWindowInitialized) {
             app.processingWindowInitialized = true;
             app.processingWindowUserMoved = false;
-            app.processingWindowLastViewportSize = viewport->Size;
         } else {
             bool posChanged =
                 (currentPos.x != app.processingWindowLastPos.x || currentPos.y != app.processingWindowLastPos.y);
-            if (posChanged && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            if (posChanged && ImGui::IsWindowFocused() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 app.processingWindowUserMoved = true;
+                app.processingWindowRightInset = viewportRight - (currentPos.x + currentSize.x);
             }
         }
 
-        float deltaViewportX = viewport->Size.x - app.processingWindowLastViewportSize.x;
-        if (!app.processingWindowUserMoved) {
-            ImVec2 targetPos;
-            targetPos.x = std::max(16.0f, viewport->Pos.x + viewport->Size.x - currentSize.x - kRightMargin);
-            targetPos.y = currentPos.y;
-            if (targetPos.x != currentPos.x) {
-                ImGui::SetWindowPos(targetPos);
-            }
-        } else if (deltaViewportX != 0.0f) {
-            ImGui::SetWindowPos(ImVec2(currentPos.x + deltaViewportX, currentPos.y));
+        // The window is anchored by its RIGHT edge: x is re-derived every
+        // frame from a distance to the viewport's right edge (the default
+        // margin, or wherever the user last dropped it), so that distance
+        // survives the main window being resized, the window's own
+        // auto-resized width changing as rows come and go, and being
+        // squeezed by ClampWindowToViewport in a too-narrow main window and
+        // then given room again. (Shifting x by each frame's viewport-width
+        // change, as this used to, kept the LEFT edge's offset instead and
+        // lost it for good once clamped.) y is top-anchored: the default
+        // slot under the orientation widget, or left wherever it was
+        // dragged.
+        float rightInset = app.processingWindowUserMoved ? app.processingWindowRightInset : kRightMargin;
+        ImVec2 targetPos;
+        targetPos.x = viewportRight - rightInset - currentSize.x;
+        targetPos.y = app.processingWindowUserMoved
+                          ? currentPos.y
+                          : viewport->Pos.y + topInset + kGizmoBottomInset + kGapBelowGizmo;
+        if (targetPos.x != currentPos.x || targetPos.y != currentPos.y) {
+            ImGui::SetWindowPos(targetPos);
         }
 
         ClampWindowToViewport(topInset);
         app.processingWindowLastPos = ImGui::GetWindowPos();
-        app.processingWindowLastViewportSize = viewport->Size;
     }
 
     if (expanded) {
@@ -3511,6 +3600,50 @@ void DrawProcessingWindow(AppState& app, float topInset = 0.0f) {
 
             float elapsedSeconds = static_cast<float>(SDL_GetTicks() - app.lbmRunStartTicks) / 1000.0f;
             ImGui::Text("%.1fs since Run", elapsedSeconds);
+
+            // Performance meters. CPU is this process only (all threads),
+            // as a fraction of every logical core; GPU is the whole
+            // device as the OS reports it, so it includes other apps and
+            // FlowCraft's own rendering — see SystemMeters.h.
+            UpdatePerfMeters(app);
+            const AppState::PerfMeters& perf = app.perfMeters;
+            ImGui::Separator();
+            if (!perf.ratesValid) {
+                ImGui::TextDisabled("Measuring performance...");
+            } else {
+                // MLUPS (million lattice-cell updates per second) is the
+                // standard, resolution-independent LBM throughput figure;
+                // it means nothing for the panel/potential-flow backends,
+                // whose "steps" are solver sweeps, so those show only the
+                // plain rate.
+                if (IsLbmBackend(app.lbmBackend) && app.voxelGridValid) {
+                    double mlups = static_cast<double>(perf.stepsPerSecond) *
+                                   static_cast<double>(app.voxelGrid.CellCount()) * 1e-6;
+                    ImGui::Text("%.1f steps/s  (%.0f MLUPS)", perf.stepsPerSecond, mlups);
+                } else {
+                    ImGui::Text("%.1f steps/s", perf.stepsPerSecond);
+                }
+
+                if (perf.cpuCoresInUse >= 0.0f) {
+                    unsigned int cores = std::max(1u, std::thread::hardware_concurrency());
+                    float cpuFraction = std::clamp(perf.cpuCoresInUse / static_cast<float>(cores), 0.0f, 1.0f);
+                    char cpuLabel[48];
+                    std::snprintf(cpuLabel, sizeof(cpuLabel), "CPU %.0f%%  (%.1f of %u cores)", cpuFraction * 100.0f,
+                                  perf.cpuCoresInUse, cores);
+                    ImGui::ProgressBar(cpuFraction, ImVec2(220.0f, 0.0f), cpuLabel);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("CPU time used by FlowCraft (all threads),\nas a share of every logical core.");
+                    }
+                }
+                if (perf.gpuUtilization >= 0.0f) {
+                    char gpuLabel[32];
+                    std::snprintf(gpuLabel, sizeof(gpuLabel), "GPU %.0f%%", perf.gpuUtilization * 100.0f);
+                    ImGui::ProgressBar(perf.gpuUtilization, ImVec2(220.0f, 0.0f), gpuLabel);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("GPU utilisation for the whole device,\nincluding rendering and other apps.");
+                    }
+                }
+            }
         }
 
         // Nested: the overlay-rebuild task specifically (the only TaskKind

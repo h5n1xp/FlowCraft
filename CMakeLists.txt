@@ -53,6 +53,7 @@ set(FC_SOURCES
     ${FC_DIR}/STLLoader.cpp
     ${FC_DIR}/SessionFile.cpp
     ${FC_DIR}/SmokeTrail.cpp
+    ${FC_DIR}/SystemMeters.cpp
     ${FC_DIR}/Voxelizer.cpp
     ${FC_DIR}/main.cpp
     ${IMGUI_DIR}/imgui.cpp
@@ -88,7 +89,8 @@ if(WIN32)
     endif()
 endif()
 if(APPLE)
-    target_link_libraries(FlowCraft PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers")
+    target_link_libraries(FlowCraft PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers"
+        "-framework IOKit" "-framework CoreFoundation")  # IOKit: SystemMeters.cpp's GPU utilisation query
     set_source_files_properties(${FC_DIR}/FileDialog.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
