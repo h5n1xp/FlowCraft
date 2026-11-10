@@ -111,8 +111,19 @@ public:
         float cpX_mm = 0.0f;
     };
 
+    struct SpanStation {
+        float yGrid = 0.0f;       // spanwise grid coordinate (0 .. ny-1)
+        float yMm = 0.0f;         // spanwise coordinate relative to model span center (mm)
+        float chordMm = 0.0f;     // local chord length (mm)
+        float clLocal = 0.0f;     // local 3D section lift coefficient at reference AoA
+        float clElliptic = 0.0f;  // ideal elliptical lift distribution at same total CL
+        float gammaNorm = 0.0f;   // normalized circulation Gamma / Gamma_max
+    };
+
     struct PolarSweepResult {
         std::vector<PolarPoint> points;
+        std::vector<SpanStation> spanStations;
+        float spanRefAlphaDeg = 4.0f;
         float clAlphaPerDeg = 0.0f;
         float clAlphaPerRad = 0.0f;
         float alphaZeroLiftDeg = 0.0f;
@@ -128,10 +139,41 @@ public:
         bool valid = false;
     };
 
+    struct SectionProfilePoint {
+        float xNorm = 0.0f;      // 0 (LE) to 1 (TE)
+        float xMm = 0.0f;        // chordwise coordinate from LE (mm)
+        float zUpperMm = 0.0f;   // upper skin height relative to LE (mm)
+        float zLowerMm = 0.0f;   // lower skin height relative to LE (mm)
+        float zCamberMm = 0.0f;  // mean camber line height relative to LE (mm)
+        float zChordMm = 0.0f;   // straight chord line height relative to LE (mm)
+        Vec3 worldUpper{0.0f, 0.0f, 0.0f};
+        Vec3 worldLower{0.0f, 0.0f, 0.0f};
+    };
+
+    struct SectionPolarResult {
+        PolarSweepResult polar;  // sectional polar curves (cl, cd, cdi, cd0, cm, ld vs alpha)
+        std::vector<SectionProfilePoint> profile;
+        int sliceY = -1;
+        float spanPosMm = 0.0f;          // lateral position relative to model span center (mm)
+        float localChordMm = 0.0f;       // local section chord (mm)
+        float maxThicknessRatio = 0.0f;  // (t/c)_max (e.g. 0.12 = 12%)
+        float maxThicknessX = 0.0f;      // chordwise x/c of max thickness
+        float maxCamberRatio = 0.0f;     // (f/c)_max (e.g. 0.02 = 2%)
+        float maxCamberX = 0.0f;         // chordwise x/c of max camber
+        float localTwistDeg = 0.0f;      // local geometric incidence/twist (deg)
+        float reynoldsNumber = 0.0f;     // local chord Reynolds number Re_c
+        float stallAlphaDeg = 14.0f;     // predicted local stall angle (deg)
+        bool valid = false;
+    };
+
     PolarSweepResult RunPolarSweep(float alphaMinDeg, float alphaMaxDeg, float alphaStepDeg,
                                   float inletVelocityMmPerS, float cellSizeMm,
                                   float refAreaM2 = 0.0f, float refChordM = 0.0f,
                                   int sweepsPerPoint = 35);
+
+    SectionPolarResult RunSectionPolarSweep(const VoxelGrid& grid, int sliceY,
+                                            float alphaMinDeg, float alphaMaxDeg, float alphaStepDeg,
+                                            float inletVelocityMmPerS, bool include3DDownwash = false) const;
 
 private:
     struct SurfacePanel {

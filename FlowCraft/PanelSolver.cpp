@@ -1184,6 +1184,36 @@ PanelSolver::PolarSweepResult PanelSolver::RunPolarSweep(float alphaMinDeg, floa
         pt.dragN = totalDragN;
         pt.cpX_mm = cpX;
         result.points.push_back(pt);
+
+        // Capture spanwise lift distribution at the point closest to +4.0 deg AoA
+        if (result.spanStations.empty() || std::fabs(alpha - 4.0f) < std::fabs(result.spanRefAlphaDeg - 4.0f)) {
+            result.spanRefAlphaDeg = alpha;
+            result.spanStations.resize(W);
+            float yCenter = 0.5f * (yMin + yMax);
+            float halfSpan = std::max(0.5f, 0.5f * (yMax - yMin));
+            float maxAbsGamma = 1e-6f;
+            for (size_t s = 0; s < W; ++s) {
+                maxAbsGamma = std::max(maxAbsGamma, std::fabs(wakeStrips_[s].gamma));
+            }
+            for (size_t s = 0; s < W; ++s) {
+                float yMid = 0.5f * (wakeStrips_[s].boundA.y + wakeStrips_[s].boundB.y);
+                float gamma = wakeStrips_[s].gamma * kFourPi;
+                float uRef = std::max(1e-4f, params_.inletVelocity);
+                float cLat = std::max(1.0f, wakeStrips_[s].chord);
+                float clLoc = (2.0f * gamma) / (uRef * cLat);
+                float eta = std::clamp((yMid - yCenter) / halfSpan, -1.0f, 1.0f);
+                float clEllip = (4.0f / kPi) * cl * std::sqrt(std::max(0.0f, 1.0f - eta * eta));
+
+                SpanStation st;
+                st.yGrid = yMid;
+                st.yMm = (yMid - yCenter) * cellSizeMm;
+                st.chordMm = wakeStrips_[s].chord * cellSizeMm;
+                st.clLocal = clLoc;
+                st.clElliptic = clEllip;
+                st.gammaNorm = wakeStrips_[s].gamma / maxAbsGamma;
+                result.spanStations[s] = st;
+            }
+        }
     }
 
     // Restore saved state
@@ -1245,4 +1275,317 @@ PanelSolver::PolarSweepResult PanelSolver::RunPolarSweep(float alphaMinDeg, floa
     }
 
     return result;
+}
+
+PanelSolver::SectionPolarResult PanelSolver::RunSectionPolarSweep(const VoxelGrid& grid, int sliceY,
+                                                                 float alphaMinDeg, float alphaMaxDeg, float alphaStepDeg,
+                                                                 float inletVelocityMmPerS, bool include3DDownwash) const {
+    SectionPolarResult sec;
+    if (grid.nx <= 0 || grid.ny <= 0 || grid.nz <= 0 || grid.solid.size() != grid.CellCount()) {
+        return sec;
+    }
+
+    sliceY = std::clamp(sliceY, 0, grid.ny - 1);
+    float yCenter = (maxY_ >= minY_) ? (0.5f * static_cast<float>(minY_ + maxY_)) : (0.5f * static_cast<float>(grid.ny));
+    sec.sliceY = sliceY;
+    sec.spanPosMm = (static_cast<float>(sliceY) - yCenter) * grid.cellSize;
+
+    const bool hasSdf = (grid.signedDistance.size() == grid.CellCount());
+    std::vector<uint8_t> hasCol(grid.nx, 0);
+    std::vector<float> zLower(grid.nx, 0.0f);
+    std::vector<float> zUpper(grid.nx, 0.0f);
+
+    auto extractColumn = [&](int x, int y, float& outZLow, float& outZHigh) -> bool {
+        int zBot = -1, zTop = -1;
+        for (int z = 0; z < grid.nz; ++z) {
+            if (grid.IsSolid(x, y, z)) {
+                if (zBot < 0) zBot = z;
+                zTop = z;
+            }
+        }
+        if (zBot < 0) return false;
+
+        float zL = static_cast<float>(zBot);
+        float zU = static_cast<float>(zTop) + 1.0f;
+        if (hasSdf) {
+            float phiBot = grid.signedDistance[grid.Index(x, y, zBot)];
+            if (zBot > 0) {
+                float phiBelow = grid.signedDistance[grid.Index(x, y, zBot - 1)];
+                if (std::isfinite(phiBot) && std::isfinite(phiBelow) && (phiBelow - phiBot) > 1e-5f) {
+                    float frac = std::clamp(phiBelow / (phiBelow - phiBot), 0.0f, 1.0f);
+                    zL = (static_cast<float>(zBot) - 0.5f) + frac;
+                }
+            }
+            float phiTop = grid.signedDistance[grid.Index(x, y, zTop)];
+            if (zTop + 1 < grid.nz) {
+                float phiAbove = grid.signedDistance[grid.Index(x, y, zTop + 1)];
+                if (std::isfinite(phiTop) && std::isfinite(phiAbove) && (phiAbove - phiTop) > 1e-5f) {
+                    float frac = std::clamp(-phiTop / (phiAbove - phiTop), 0.0f, 1.0f);
+                    zU = (static_cast<float>(zTop) + 0.5f) + frac;
+                }
+            }
+        }
+        outZLow = zL;
+        outZHigh = std::max(zU, zL + 0.05f);
+        return true;
+    };
+
+    for (int x = 0; x < grid.nx; ++x) {
+        if (extractColumn(x, sliceY, zLower[x], zUpper[x])) {
+            hasCol[x] = 1;
+        }
+    }
+
+    // Bridge single-voxel gaps along chord
+    for (int x = 1; x + 1 < grid.nx; ++x) {
+        if (!hasCol[x] && hasCol[x - 1] && hasCol[x + 1]) {
+            hasCol[x] = 1;
+            zLower[x] = 0.5f * (zLower[x - 1] + zLower[x + 1]);
+            zUpper[x] = 0.5f * (zUpper[x - 1] + zUpper[x + 1]);
+        }
+    }
+
+    // Find the primary (longest) contiguous chordwise segment at this slice station
+    int bestStart = -1, bestEnd = -1, bestLen = 0;
+    int curStart = -1;
+    for (int x = 0; x < grid.nx; ++x) {
+        if (hasCol[x]) {
+            if (curStart < 0) curStart = x;
+            int len = x - curStart + 1;
+            if (len > bestLen) {
+                bestLen = len;
+                bestStart = curStart;
+                bestEnd = x;
+            }
+        } else {
+            curStart = -1;
+        }
+    }
+
+    if (bestLen < 3 || bestStart < 0) {
+        return sec;
+    }
+
+    // Light 2-pass smoothing on interior upper/lower surfaces to remove grid staircase ripple
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<float> nextL = zLower;
+        std::vector<float> nextU = zUpper;
+        for (int x = bestStart + 1; x < bestEnd; ++x) {
+            nextL[x] = 0.25f * zLower[x - 1] + 0.50f * zLower[x] + 0.25f * zLower[x + 1];
+            nextU[x] = 0.25f * zUpper[x - 1] + 0.50f * zUpper[x] + 0.25f * zUpper[x + 1];
+        }
+        zLower.swap(nextL);
+        zUpper.swap(nextU);
+    }
+
+    const bool rev = params_.reverseFlow;
+    const int xLeIdx = rev ? bestEnd : bestStart;
+    const int xTeIdx = rev ? bestStart : bestEnd;
+    const int stepDir = rev ? -1 : 1;
+    const int numPts = bestLen;
+
+    const float xLeLat = static_cast<float>(xLeIdx) + 0.5f;
+    const float zLeLat = 0.5f * (zUpper[xLeIdx] + zLower[xLeIdx]);
+    const float xTeLat = static_cast<float>(xTeIdx) + 0.5f;
+    const float zTeLat = 0.5f * (zUpper[xTeIdx] + zLower[xTeIdx]);
+
+    const float dxLat = std::max(1.0f, std::fabs(xTeLat - xLeLat));
+    const float dzLat = zLeLat - zTeLat;  // positive = nose-up geometric twist/incidence
+    const float chordLat = std::sqrt(dxLat * dxLat + dzLat * dzLat);
+    const float localChordMm = chordLat * grid.cellSize;
+    const float localTwistRad = std::atan2(dzLat, dxLat);
+    const float localTwistDeg = localTwistRad * (180.0f / kPi);
+    const float cosTwist = std::cos(localTwistRad);
+
+    sec.localChordMm = localChordMm;
+    sec.localTwistDeg = localTwistDeg;
+    sec.profile.reserve(numPts);
+
+    float maxThickRatio = 0.01f;
+    float maxThickX = 0.30f;
+    float maxAbsCamber = 0.0f;
+    float signedMaxCamber = 0.0f;
+    float maxCamberX = 0.40f;
+
+    for (int m = 0; m < numPts; ++m) {
+        int xIdx = xLeIdx + m * stepDir;
+        float xNorm = static_cast<float>(m) / static_cast<float>(std::max(1, numPts - 1));
+        float zChordLat = zLeLat + xNorm * (zTeLat - zLeLat);
+        float zCambLat = 0.5f * (zUpper[xIdx] + zLower[xIdx]);
+        float thickLat = (zUpper[xIdx] - zLower[xIdx]) * cosTwist;
+        float camberLat = (zCambLat - zChordLat) * cosTwist;
+
+        float tRatio = thickLat / chordLat;
+        float fRatio = camberLat / chordLat;
+        if (tRatio > maxThickRatio) {
+            maxThickRatio = tRatio;
+            maxThickX = xNorm;
+        }
+        if (xNorm >= 0.05f && xNorm <= 0.95f && std::fabs(fRatio) > maxAbsCamber) {
+            maxAbsCamber = std::fabs(fRatio);
+            signedMaxCamber = fRatio;
+            maxCamberX = xNorm;
+        }
+
+        SectionProfilePoint pt;
+        pt.xNorm = xNorm;
+        pt.xMm = xNorm * localChordMm;
+        pt.zUpperMm = (zUpper[xIdx] - zLeLat) * grid.cellSize;
+        pt.zLowerMm = (zLower[xIdx] - zLeLat) * grid.cellSize;
+        pt.zCamberMm = (zCambLat - zLeLat) * grid.cellSize;
+        pt.zChordMm = (zChordLat - zLeLat) * grid.cellSize;
+
+        float worldX = grid.origin.x + (static_cast<float>(sliceY) + 0.5f) * grid.cellSize;
+        float worldY = grid.origin.y + (static_cast<float>(xIdx) + 0.5f) * grid.cellSize;
+        pt.worldUpper = Vec3{worldX, worldY, grid.origin.z + zUpper[xIdx] * grid.cellSize};
+        pt.worldLower = Vec3{worldX, worldY, grid.origin.z + zLower[xIdx] * grid.cellSize};
+        sec.profile.push_back(pt);
+    }
+
+    sec.maxThicknessRatio = std::clamp(maxThickRatio, 0.01f, 0.60f);
+    sec.maxThicknessX = maxThickX;
+    sec.maxCamberRatio = std::clamp(signedMaxCamber, -0.20f, 0.20f);
+    sec.maxCamberX = maxCamberX;
+
+    // Sample camber line slope df/dx via Glauert transformation xi = 0.5 * (1 - cos(theta))
+    auto sampleCamberNorm = [&](float xi) -> float {
+        xi = std::clamp(xi, 0.0f, 1.0f);
+        float fIdx = xi * static_cast<float>(numPts - 1);
+        int i0 = std::clamp(static_cast<int>(fIdx), 0, numPts - 1);
+        int i1 = std::min(i0 + 1, numPts - 1);
+        float frac = fIdx - static_cast<float>(i0);
+        float c0 = (sec.profile[i0].zCamberMm - sec.profile[i0].zChordMm) / std::max(1e-3f, localChordMm);
+        float c1 = (sec.profile[i1].zCamberMm - sec.profile[i1].zChordMm) / std::max(1e-3f, localChordMm);
+        return (c0 * (1.0f - frac) + c1 * frac) * cosTwist;
+    };
+
+    constexpr int kGlauertNodes = 32;
+    float sumAlpha0 = 0.0f, sumA1 = 0.0f, sumA2 = 0.0f;
+    const float dTheta = kPi / static_cast<float>(kGlauertNodes);
+    for (int k = 0; k < kGlauertNodes; ++k) {
+        float theta = (static_cast<float>(k) + 0.5f) * dTheta;
+        float xi = 0.5f * (1.0f - std::cos(theta));
+        float eps = 0.04f;
+        float dfdx = (sampleCamberNorm(xi + eps) - sampleCamberNorm(xi - eps)) / (2.0f * eps);
+        dfdx = std::clamp(dfdx, -0.35f, 0.35f);
+        sumAlpha0 += dfdx * (std::cos(theta) - 1.0f) * dTheta;
+        sumA1 += dfdx * std::cos(theta) * dTheta;
+        sumA2 += dfdx * std::cos(2.0f * theta) * dTheta;
+    }
+    const float alpha0CamberRad = -sumAlpha0 / kPi;
+    const float A1 = (2.0f / kPi) * sumA1;
+    const float A2 = (2.0f / kPi) * sumA2;
+    const float cm0 = 0.25f * kPi * (A2 - A1);
+
+    // Local Reynolds number and boundary-layer parameters
+    constexpr float kRhoAir = 1.225f;
+    constexpr float kNuAir = 1.48e-5f;
+    const float vInf = std::max(0.1f, inletVelocityMmPerS * 1e-3f);
+    const float chordM = std::max(1e-4f, localChordMm * 1e-3f);
+    const float Re = (vInf * chordM) / kNuAir;
+    sec.reynoldsNumber = Re;
+
+    // 2D viscous-corrected lift slope & thickness factor
+    const float tcEff = std::min(0.25f, sec.maxThicknessRatio);
+    const float etaVisc = std::clamp(0.86f + 0.035f * std::log10(std::max(Re, 1000.0f) / 1000.0f), 0.85f, 0.98f);
+    float clAlphaRad = 2.0f * kPi * etaVisc * (1.0f + 0.77f * tcEff);
+
+    // Optional 3D local spanwise downwash correction
+    float spanLat = static_cast<float>(std::max(1, maxY_ - minY_ + 1));
+    float spanM = spanLat * grid.cellSize * 1e-3f;
+    float localAR = std::max(1.5f, spanM / chordM);
+    if (include3DDownwash) {
+        float halfSpan = std::max(1.0f, 0.5f * spanLat);
+        float etaSpan = std::clamp(std::fabs(static_cast<float>(sliceY) - yCenter) / halfSpan, 0.0f, 0.98f);
+        float tipFactor = 1.0f + 1.5f * (etaSpan * etaSpan * etaSpan * etaSpan);
+        clAlphaRad = clAlphaRad / (1.0f + (clAlphaRad / (kPi * localAR)) * tipFactor);
+    }
+
+    const float alphaZeroLiftDeg = std::clamp(alpha0CamberRad * (180.0f / kPi), -8.0f, 8.0f) - localTwistDeg;
+    const float deltaAlphaStallDeg = 9.5f + 38.0f * std::min(0.18f, sec.maxThicknessRatio) +
+                                     1.2f * std::log10(std::max(Re, 1e4f) / 1e4f);
+    sec.stallAlphaDeg = alphaZeroLiftDeg + deltaAlphaStallDeg;
+
+    // Profile drag: Schlichting skin friction + Hoerner thickness form factor
+    const float cf = 0.074f / std::pow(std::max(Re, 2000.0f), 0.2f);
+    const float formFactor = 1.0f + 2.0f * tcEff + 60.0f * (tcEff * tcEff * tcEff * tcEff);
+    const float cdMin = std::max(0.005f, 2.0f * cf * formFactor);
+    const float clIdeal = std::clamp(-kPi * A1, -0.6f, 0.8f);
+
+    if (alphaStepDeg <= 0.01f) alphaStepDeg = 1.0f;
+    if (alphaMaxDeg < alphaMinDeg) std::swap(alphaMinDeg, alphaMaxDeg);
+    int numPoints = static_cast<int>(std::floor((alphaMaxDeg - alphaMinDeg) / alphaStepDeg + 0.5f)) + 1;
+    sec.polar.points.reserve(numPoints);
+
+    const float qInf = 0.5f * kRhoAir * vInf * vInf;
+    const float stripSpanM = grid.cellSize * 1e-3f;
+    const float stripAreaM2 = chordM * stripSpanM;
+
+    for (int pIdx = 0; pIdx < numPoints; ++pIdx) {
+        float alphaDeg = alphaMinDeg + static_cast<float>(pIdx) * alphaStepDeg;
+        float dAlphaDeg = alphaDeg - alphaZeroLiftDeg;
+        float dAlphaRad = dAlphaDeg * (kPi / 180.0f);
+
+        // Kirchhoff trailing-edge separation factor f_sep in [0.05, 1.0]
+        float absDA = std::fabs(dAlphaDeg);
+        float onsetDeg = 0.72f * deltaAlphaStallDeg;
+        float fSep = 1.0f;
+        float sepDrag = 0.0f;
+        if (absDA > onsetDeg) {
+            float excess = (absDA - onsetDeg) / std::max(1.5f, deltaAlphaStallDeg - onsetDeg);
+            fSep = 1.0f / (1.0f + 0.45f * excess * excess);
+            sepDrag = 0.025f * excess * excess;
+        }
+        float kirchhoff = 0.25f * (1.0f + std::sqrt(fSep)) * (1.0f + std::sqrt(fSep));
+        float cl = clAlphaRad * dAlphaRad * kirchhoff;
+
+        float cdProfile = cdMin + 0.014f * (cl - clIdeal) * (cl - clIdeal) + sepDrag;
+        float cdi = include3DDownwash ? ((cl * cl) / (kPi * localAR * 0.85f)) : 0.0f;
+        float cd = cdProfile + cdi;
+        float ld = (cd > 1e-6f) ? (cl / cd) : 0.0f;
+
+        // Quarter-chord pitching moment with stall rearward CP shift
+        float cmStallShift = (absDA > onsetDeg) ? (-0.04f * (1.0f - fSep) * (dAlphaDeg >= 0.0f ? 1.0f : -1.0f)) : 0.0f;
+        float cm = cm0 - 0.015f * cl + cmStallShift;
+
+        // Center of pressure along section chord (in mm from LE)
+        float xCpNorm = (std::fabs(cl) > 0.05f) ? std::clamp(0.25f - (cm / cl), 0.05f, 0.95f) : 0.25f;
+
+        PolarPoint pt;
+        pt.alphaDeg = alphaDeg;
+        pt.cl = cl;
+        pt.cd = cd;
+        pt.cdi = cdi;
+        pt.cd0 = cdProfile;
+        pt.cm = cm;
+        pt.ld = ld;
+        pt.liftN = cl * qInf * stripAreaM2;
+        pt.dragN = cd * qInf * stripAreaM2;
+        pt.cpX_mm = xCpNorm * localChordMm;
+        sec.polar.points.push_back(pt);
+    }
+
+    sec.polar.clAlphaPerRad = clAlphaRad;
+    sec.polar.clAlphaPerDeg = clAlphaRad * (kPi / 180.0f);
+    sec.polar.alphaZeroLiftDeg = alphaZeroLiftDeg;
+    sec.polar.minCD0 = cdMin;
+    sec.polar.refAreaM2 = stripAreaM2;
+    sec.polar.refChordM = chordM;
+    sec.polar.refSpanM = stripSpanM;
+    sec.polar.aspectRatio = include3DDownwash ? localAR : 0.0f;
+    sec.polar.neutralPointX_mm = 0.25f * localChordMm;
+
+    float maxLD = -1e30f;
+    float alphaAtMax = 0.0f;
+    for (const PolarPoint& pt : sec.polar.points) {
+        if (pt.ld > maxLD) {
+            maxLD = pt.ld;
+            alphaAtMax = pt.alphaDeg;
+        }
+    }
+    sec.polar.maxLD = maxLD;
+    sec.polar.alphaAtMaxLD = alphaAtMax;
+    sec.polar.valid = !sec.polar.points.empty();
+    sec.valid = sec.polar.valid;
+    return sec;
 }

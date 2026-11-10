@@ -822,6 +822,10 @@ struct AppState {
 
     // Aero Polars window state (XFLR5-style multi-point polar generation & graphing)
     bool showAeroPolarsWindow = false;
+    // 0 = Whole Model (3D Assembly), 1 = Active Y-Slice (2D Section), 2 = Compare Both (Overlay)
+    int polarScopeMode = 2;
+    bool polarSliceInclude3DDownwash = false;
+    int polarTableSource = 0;  // 0 = Whole Model, 1 = Active Slice
     float polarAlphaMin = -4.0f;
     float polarAlphaMax = 14.0f;
     float polarAlphaStep = 1.0f;
@@ -829,6 +833,12 @@ struct AppState {
     float polarRefAreaM2 = 0.0f;
     float polarRefChordM = 0.0f;
     PanelSolver::PolarSweepResult polarResult;
+    PanelSolver::SectionPolarResult sectionPolarResult;
+    float lastSectionAlphaMin = 0.0f;
+    float lastSectionAlphaMax = 0.0f;
+    float lastSectionAlphaStep = 0.0f;
+    float lastSectionInletVel = 0.0f;
+    bool lastSectionDownwash = false;
     std::string polarExportStatus;
 
     // 0 = Normal (Fusion Ribbon + dark theme), 1 = Classic (single-window UI + dark theme),
@@ -1250,6 +1260,9 @@ void ResetVoxelization(AppState& app) {
 
     app.lbmForcesValidAtomic.store(false, std::memory_order_relaxed);
     app.overlayValid = false;
+    app.polarResult = {};
+    app.sectionPolarResult = {};
+    app.panelSolver.Shutdown();
     ClearFlowDivergence(app);
     // -1 so each plane (whichever are still enabled — that choice itself
     // persists across re-voxelization, same as before) re-defaults to the
@@ -2682,6 +2695,9 @@ void ResetStateForNewMesh(AppState& app) {
     app.lbmRunning = false;
     app.lbmForcesValidAtomic.store(false, std::memory_order_relaxed);
     app.overlayValid = false;
+    app.polarResult = {};
+    app.sectionPolarResult = {};
+    app.panelSolver.Shutdown();
     ClearFlowDivergence(app);
     for (AppState::SlicePlaneState& plane : app.slicePlanes) {
         plane.index = -1;
@@ -3857,14 +3873,83 @@ void DrawFlowDivergenceBanner(AppState& app, float topInset, bool busy) {
     ImGui::PopStyleColor(2);
 }
 
+// Projects the active Y-slice plane and the extracted 2D airfoil cross-section
+// contour directly onto the 3D viewport when the Aero Polars window is open in
+// Active Slice or Compare Both mode. Uses GetBackgroundDrawList() so it renders
+// over the 3D scene and strictly underneath all floating ImGui windows.
+void DrawPolarSliceHighlight(const AppState& app) {
+    if (!app.showAeroPolarsWindow || !app.meshLoaded || !app.voxelGridValid) return;
+    if (app.polarScopeMode != 1 && app.polarScopeMode != 2) return;
+
+    const VoxelGrid& grid = app.voxelGrid;
+    int sliceY = app.slicePlanes[static_cast<size_t>(SliceAxis::Y)].index;
+    if (sliceY < 0) sliceY = grid.ny / 2;
+    sliceY = std::clamp(sliceY, 0, std::max(0, grid.ny - 1));
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    float width = viewport->Size.x;
+    float height = viewport->Size.y;
+    if (width <= 1.0f || height <= 1.0f) return;
+
+    Mat4 view = app.camera.ViewMatrix();
+    OrbitCamera::ClipPlanes clip = app.camera.NearFar();
+    Mat4 viewProj = Mat4::Perspective(0.9f, width / height, clip.nearZ, clip.farZ) * view;
+
+    auto ProjectToScreen = [&](const Vec3& worldPos, bool& inFront) -> ImVec2 {
+        float x = viewProj.m[0] * worldPos.x + viewProj.m[4] * worldPos.y + viewProj.m[8] * worldPos.z + viewProj.m[12];
+        float y = viewProj.m[1] * worldPos.x + viewProj.m[5] * worldPos.y + viewProj.m[9] * worldPos.z + viewProj.m[13];
+        float w = viewProj.m[3] * worldPos.x + viewProj.m[7] * worldPos.y + viewProj.m[11] * worldPos.z + viewProj.m[15];
+        inFront = (w > 1e-4f);
+        w = std::max(w, 1e-4f);
+        return ImVec2(viewport->Pos.x + (x / w * 0.5f + 0.5f) * width,
+                      viewport->Pos.y + (1.0f - (y / w * 0.5f + 0.5f)) * height);
+    };
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    // 1. Translucent slice plane bounding frame at worldX
+    float worldX = grid.origin.x + (static_cast<float>(sliceY) + 0.5f) * grid.cellSize;
+    float y0 = grid.origin.y;
+    float y1 = grid.origin.y + static_cast<float>(grid.nx) * grid.cellSize;
+    float z0 = grid.origin.z;
+    float z1 = grid.origin.z + static_cast<float>(grid.nz) * grid.cellSize;
+
+    bool ok00 = false, ok10 = false, ok11 = false, ok01 = false;
+    ImVec2 c00 = ProjectToScreen(Vec3{worldX, y0, z0}, ok00);
+    ImVec2 c10 = ProjectToScreen(Vec3{worldX, y1, z0}, ok10);
+    ImVec2 c11 = ProjectToScreen(Vec3{worldX, y1, z1}, ok11);
+    ImVec2 c01 = ProjectToScreen(Vec3{worldX, y0, z1}, ok01);
+    if (ok00 && ok10 && ok11 && ok01) {
+        dl->AddQuadFilled(c00, c10, c11, c01, IM_COL32(0, 210, 255, 20));
+        dl->AddQuad(c00, c10, c11, c01, IM_COL32(0, 210, 255, 130), 1.5f);
+    }
+
+    // 2. Highlight extracted 2D airfoil contour directly on the 3D model
+    if (app.sectionPolarResult.valid && app.sectionPolarResult.profile.size() >= 2) {
+        const auto& prof = app.sectionPolarResult.profile;
+        for (size_t i = 0; i + 1 < prof.size(); ++i) {
+            bool u0Ok = false, u1Ok = false, l0Ok = false, l1Ok = false;
+            ImVec2 u0 = ProjectToScreen(prof[i].worldUpper, u0Ok);
+            ImVec2 u1 = ProjectToScreen(prof[i + 1].worldUpper, u1Ok);
+            ImVec2 l0 = ProjectToScreen(prof[i].worldLower, l0Ok);
+            ImVec2 l1 = ProjectToScreen(prof[i + 1].worldLower, l1Ok);
+            if (u0Ok && u1Ok) dl->AddLine(u0, u1, IM_COL32(255, 210, 40, 245), 2.6f);
+            if (l0Ok && l1Ok) dl->AddLine(l0, l1, IM_COL32(40, 235, 255, 245), 2.6f);
+        }
+    }
+}
+
 // Interactive Aero Polars Window: runs multi-point angle-of-attack sweeps
-// using the 3D Lifting Panel Method and plots CL vs Alpha, CD vs CL, L/D vs Alpha,
-// and CM vs Alpha using ImPlot (replacing XFLR5-style polar generation).
+// using the 3D Lifting Panel Method and/or the Active Y-Slice 2D Airfoil
+// Section, plotting CL vs Alpha, CD vs CL, L/D vs Alpha, CM vs Alpha,
+// 2D Airfoil Section Geometry, and Spanwise Lift Distribution via ImPlot.
 void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
     if (!app.showAeroPolarsWindow) return;
 
+    DrawPolarSliceHighlight(app);
+
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowSize(ImVec2(880.0f, 620.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(920.0f, 660.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + 80.0f, viewport->Pos.y + topInset + 20.0f), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Aero Polars & Flight Envelopes (XFLR5-Style)", &app.showAeroPolarsWindow)) {
@@ -3874,21 +3959,15 @@ void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
             return;
         }
 
-        ImGui::TextColored(ImVec4(0.35f, 0.82f, 1.0f, 1.0f), "Polar Sweep (3D Lifting Panel Method)");
-        ImGui::Spacing();
+        // Ensure Y-slice index is initialized
+        AppState::SlicePlaneState& yPlane = app.slicePlanes[static_cast<size_t>(SliceAxis::Y)];
+        int sliceMaxY = std::max(0, app.voxelGrid.ny - 1);
+        if (yPlane.index < 0 || yPlane.index > sliceMaxY) {
+            yPlane.index = sliceMaxY / 2;
+            yPlane.indexAtomic.store(yPlane.index, std::memory_order_relaxed);
+        }
 
-        ImGui::PushItemWidth(110.0f);
-        ImGui::DragFloat("Min AoA", &app.polarAlphaMin, 0.5f, -20.0f, app.polarAlphaMax, "%.1f deg");
-        ImGui::SameLine();
-        ImGui::DragFloat("Max AoA", &app.polarAlphaMax, 0.5f, app.polarAlphaMin, 35.0f, "%.1f deg");
-        ImGui::SameLine();
-        ImGui::DragFloat("Step", &app.polarAlphaStep, 0.25f, 0.25f, 5.0f, "%.2f deg");
-        ImGui::PopItemWidth();
-
-        ImGui::SameLine(0.0f, 18.0f);
-        bool busy = app.taskKind.load(std::memory_order_acquire) != TaskKind::None;
-        ImGui::BeginDisabled(busy);
-        if (ImGui::Button("Run Polar Sweep", ImVec2(150.0f, 0.0f))) {
+        auto runFullPolarSweep = [&]() {
             if (!app.panelSolver.NumPanels() && app.voxelGridValid) {
                 PanelSolver::Params pParams{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow};
                 app.panelSolver.Init(app.gpuDevice, false, app.voxelGrid, pParams);
@@ -3903,67 +3982,214 @@ void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
                 app.polarRefAreaM2 = app.polarResult.refAreaM2;
                 app.polarRefChordM = app.polarResult.refChordM;
             }
+        };
+
+        auto refreshSectionPolar = [&]() {
+            if (!app.panelSolver.NumPanels() && app.voxelGridValid) {
+                PanelSolver::Params pParams{app.lbmParams.inletVelocity, app.lbmParams.reverseFlow};
+                app.panelSolver.Init(app.gpuDevice, false, app.voxelGrid, pParams);
+            }
+            app.sectionPolarResult = app.panelSolver.RunSectionPolarSweep(
+                app.voxelGrid, yPlane.index,
+                app.polarAlphaMin, app.polarAlphaMax, app.polarAlphaStep,
+                app.lbmInletVelocityMmPerS, app.polarSliceInclude3DDownwash);
+            app.lastSectionAlphaMin = app.polarAlphaMin;
+            app.lastSectionAlphaMax = app.polarAlphaMax;
+            app.lastSectionAlphaStep = app.polarAlphaStep;
+            app.lastSectionInletVel = app.lbmInletVelocityMmPerS;
+            app.lastSectionDownwash = app.polarSliceInclude3DDownwash;
+        };
+
+        bool busy = app.taskKind.load(std::memory_order_acquire) != TaskKind::None;
+
+        // Auto-populate initial 3D & section polars on first open
+        if (!app.polarResult.valid && !busy) {
+            runFullPolarSweep();
+            refreshSectionPolar();
+        }
+
+        // Top controls: AoA Sweep Range & Run button
+        ImGui::PushItemWidth(105.0f);
+        ImGui::DragFloat("Min AoA", &app.polarAlphaMin, 0.5f, -20.0f, app.polarAlphaMax, "%.1f deg");
+        ImGui::SameLine();
+        ImGui::DragFloat("Max AoA", &app.polarAlphaMax, 0.5f, app.polarAlphaMin, 35.0f, "%.1f deg");
+        ImGui::SameLine();
+        ImGui::DragFloat("Step", &app.polarAlphaStep, 0.25f, 0.25f, 5.0f, "%.2f deg");
+        ImGui::PopItemWidth();
+
+        ImGui::SameLine(0.0f, 16.0f);
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Run Polar Sweep", ImVec2(145.0f, 0.0f))) {
+            runFullPolarSweep();
+            refreshSectionPolar();
         }
         ImGui::EndDisabled();
 
-        ImGui::Checkbox("Auto-compute Reference Geometry", &app.polarAutoRefGeometry);
+        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::Checkbox("Auto Ref Geometry", &app.polarAutoRefGeometry);
         if (!app.polarAutoRefGeometry) {
-            ImGui::SameLine();
-            ImGui::PushItemWidth(110.0f);
+            ImGui::PushItemWidth(100.0f);
             ImGui::DragFloat("Ref Area S (m2)", &app.polarRefAreaM2, 0.001f, 0.0001f, 100.0f, "%.4f");
             ImGui::SameLine();
             ImGui::DragFloat("Ref Chord c (m)", &app.polarRefChordM, 0.001f, 0.0001f, 10.0f, "%.4f");
             ImGui::PopItemWidth();
         }
 
-        if (app.polarResult.valid) {
+        // Scope Selection & Active Y-Slice Bar
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.35f, 0.82f, 1.0f, 1.0f), "Scope:");
+        ImGui::SameLine();
+        ImGui::RadioButton("Whole Model (3D)", &app.polarScopeMode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Active Y-Slice (2D Section)", &app.polarScopeMode, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("Compare Both (Overlay)", &app.polarScopeMode, 2);
+
+        if (app.polarScopeMode == 1 || app.polarScopeMode == 2) {
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.25f, 1.0f), "Active Y-Slice:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            if (ImGui::SliderInt("##polar_slice_y", &yPlane.index, 0, sliceMaxY, "Y Index %d")) {
+                yPlane.indexAtomic.store(yPlane.index, std::memory_order_relaxed);
+                if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::Slice && yPlane.enabled) {
+                    StartResliceTask(app);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Center##polar_slice_center")) {
+                yPlane.index = sliceMaxY / 2;
+                yPlane.indexAtomic.store(yPlane.index, std::memory_order_relaxed);
+                if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::Slice && yPlane.enabled) {
+                    StartResliceTask(app);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Show Flow Slice")) {
+                yPlane.enabled = true;
+                yPlane.enabledAtomic.store(true, std::memory_order_relaxed);
+                app.overlayStyle = OverlayStyle::Slice;
+                app.overlayStyleAtomic.store(static_cast<int>(app.overlayStyle), std::memory_order_relaxed);
+                if (app.overlayValid) {
+                    app.viewMode = ViewMode::FlowOverlay;
+                    StartResliceTask(app);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Enable the Y (side-on) slice plane in the 3D visualizer.\n"
+                                  "Even in Solid Mesh view, the active slice contour is highlighted directly on the 3D model.");
+            }
+            ImGui::SameLine(0.0f, 12.0f);
+            ImGui::Checkbox("Include 3D Downwash at Slice", &app.polarSliceInclude3DDownwash);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Unchecked: Pure 2D isolated airfoil polar (XFoil-style, no tip induced drag).\n"
+                                  "Checked: Includes local 3D finite-wing downwash and induced drag at this span station.");
+            }
+        }
+
+        // Live refresh of the active Y-slice section polar whenever the slice moves or parameters change
+        if (app.sectionPolarResult.sliceY != yPlane.index ||
+            app.lastSectionAlphaMin != app.polarAlphaMin ||
+            app.lastSectionAlphaMax != app.polarAlphaMax ||
+            app.lastSectionAlphaStep != app.polarAlphaStep ||
+            app.lastSectionInletVel != app.lbmInletVelocityMmPerS ||
+            app.lastSectionDownwash != app.polarSliceInclude3DDownwash) {
+            refreshSectionPolar();
+        }
+
+        const bool show3D = (app.polarScopeMode == 0 || app.polarScopeMode == 2) && app.polarResult.valid;
+        const bool showSec = (app.polarScopeMode == 1 || app.polarScopeMode == 2) && app.sectionPolarResult.valid;
+
+        if (app.polarResult.valid || app.sectionPolarResult.valid) {
             ImGui::Separator();
-            const PanelSolver::PolarSweepResult& res = app.polarResult;
-            ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.5f, 1.0f),
-                               "CL_alpha: %.3f /deg (%.2f /rad)  |  alpha_0: %.2f deg  |  (L/D)max: %.1f @ %.1f deg  |  CD0: %.4f  |  e: %.2f  |  AR: %.2f",
-                               res.clAlphaPerDeg, res.clAlphaPerRad, res.alphaZeroLiftDeg,
-                               res.maxLD, res.alphaAtMaxLD, res.minCD0, res.oswaldEfficiency, res.aspectRatio);
-            ImGui::TextDisabled("Ref: S = %.4f m2 (%.1f cm2), Mean Chord = %.1f mm, Span = %.1f mm, Neutral Point X = %.1f mm",
-                                res.refAreaM2, res.refAreaM2 * 10000.0f, res.refChordM * 1000.0f,
-                                res.refSpanM * 1000.0f, res.neutralPointX_mm);
+            if (show3D) {
+                const PanelSolver::PolarSweepResult& res = app.polarResult;
+                ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.5f, 1.0f),
+                                   "[3D Model]  CL_alpha: %.3f /deg (%.2f /rad)  |  alpha_0: %.2f deg  |  (L/D)max: %.1f @ %.1f deg  |  CD0: %.4f  |  e: %.2f  |  AR: %.2f",
+                                   res.clAlphaPerDeg, res.clAlphaPerRad, res.alphaZeroLiftDeg,
+                                   res.maxLD, res.alphaAtMaxLD, res.minCD0, res.oswaldEfficiency, res.aspectRatio);
+            }
+            if (app.polarScopeMode == 1 || app.polarScopeMode == 2) {
+                if (app.sectionPolarResult.valid) {
+                    const PanelSolver::SectionPolarResult& sec = app.sectionPolarResult;
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.28f, 1.0f),
+                                       "[Y-Slice @ %+.1f mm]  Chord: %.1f mm  |  t/c: %.1f%%  |  Camber: %+.1f%%  |  Twist: %+.1f deg  |  Re: %.0f  |  (l/d)max: %.1f @ %.1f deg",
+                                       sec.spanPosMm, sec.localChordMm, sec.maxThicknessRatio * 100.0f,
+                                       sec.maxCamberRatio * 100.0f, sec.localTwistDeg, sec.reynoldsNumber,
+                                       sec.polar.maxLD, sec.polar.alphaAtMaxLD);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                                       "[Y-Slice Index %d]  Slice is in empty air outside the model — drag the Active Y-Slice slider onto the airframe.",
+                                       yPlane.index);
+                }
+            }
             ImGui::Spacing();
 
-            size_t n = res.points.size();
-            std::vector<float> alphas(n), cls(n), cds(n), cdis(n), cd0s(n), lds(n), cms(n);
-            std::vector<float> clFitAlphas(n), clFitCls(n);
-            for (size_t i = 0; i < n; ++i) {
-                alphas[i] = res.points[i].alphaDeg;
-                cls[i] = res.points[i].cl;
-                cds[i] = res.points[i].cd;
-                cdis[i] = res.points[i].cdi;
-                cd0s[i] = res.points[i].cd0;
-                lds[i] = res.points[i].ld;
-                cms[i] = res.points[i].cm;
-                clFitAlphas[i] = alphas[i];
-                clFitCls[i] = res.clAlphaPerDeg * (alphas[i] - res.alphaZeroLiftDeg);
+            // Prepare 3D Whole-Model vectors
+            const PanelSolver::PolarSweepResult& res3D = app.polarResult;
+            size_t n3D = res3D.points.size();
+            std::vector<float> alphas3D(n3D), cls3D(n3D), cds3D(n3D), cdis3D(n3D), lds3D(n3D), cms3D(n3D);
+            std::vector<float> clFitAlphas3D(n3D), clFitCls3D(n3D);
+            for (size_t i = 0; i < n3D; ++i) {
+                alphas3D[i] = res3D.points[i].alphaDeg;
+                cls3D[i] = res3D.points[i].cl;
+                cds3D[i] = res3D.points[i].cd;
+                cdis3D[i] = res3D.points[i].cdi;
+                lds3D[i] = res3D.points[i].ld;
+                cms3D[i] = res3D.points[i].cm;
+                clFitAlphas3D[i] = alphas3D[i];
+                clFitCls3D[i] = res3D.clAlphaPerDeg * (alphas3D[i] - res3D.alphaZeroLiftDeg);
+            }
+
+            // Prepare 2D Active-Slice vectors
+            const PanelSolver::PolarSweepResult& resSec = app.sectionPolarResult.polar;
+            size_t nSec = resSec.points.size();
+            std::vector<float> alphasSec(nSec), clsSec(nSec), cdsSec(nSec), cdisSec(nSec), ldsSec(nSec), cmsSec(nSec);
+            for (size_t i = 0; i < nSec; ++i) {
+                alphasSec[i] = resSec.points[i].alphaDeg;
+                clsSec[i] = resSec.points[i].cl;
+                cdsSec[i] = resSec.points[i].cd;
+                cdisSec[i] = resSec.points[i].cdi;
+                ldsSec[i] = resSec.points[i].ld;
+                cmsSec[i] = resSec.points[i].cm;
             }
 
             if (ImGui::BeginTabBar("##AeroPolarTabs")) {
                 if (ImGui::BeginTabItem("Lift & Drag Polar")) {
                     float availW = ImGui::GetContentRegionAvail().x;
                     float plotW = std::max(280.0f, (availW - 16.0f) * 0.5f);
-                    float plotH = std::max(280.0f, ImGui::GetContentRegionAvail().y - 10.0f);
+                    float plotH = std::max(260.0f, ImGui::GetContentRegionAvail().y - 10.0f);
 
                     if (ImPlot::BeginPlot("Lift Curve (CL vs Alpha)", ImVec2(plotW, plotH))) {
                         ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Lift Coefficient CL");
                         ImPlot::SetupLegend(ImPlotLocation_NorthWest);
-                        ImPlot::PlotLine("CL (Panel/VLM)", alphas.data(), cls.data(), static_cast<int>(n));
-                        ImPlot::PlotScatter("Data Points", alphas.data(), cls.data(), static_cast<int>(n));
-                        ImPlot::PlotLine("Linear Slope dCL/dAlpha", clFitAlphas.data(), clFitCls.data(), static_cast<int>(n));
+                        if (show3D && n3D > 0) {
+                            ImPlot::PlotLine("3D Whole Model CL", alphas3D.data(), cls3D.data(), static_cast<int>(n3D));
+                            ImPlot::PlotScatter("##3d_cl_pts", alphas3D.data(), cls3D.data(), static_cast<int>(n3D));
+                            if (app.polarScopeMode == 0) {
+                                ImPlot::PlotLine("Linear Slope dCL/dAlpha", clFitAlphas3D.data(), clFitCls3D.data(), static_cast<int>(n3D));
+                            }
+                        }
+                        if (showSec && nSec > 0) {
+                            ImPlot::PlotLine("Active Y-Slice Section cl", alphasSec.data(), clsSec.data(), static_cast<int>(nSec));
+                            ImPlot::PlotScatter("##sec_cl_pts", alphasSec.data(), clsSec.data(), static_cast<int>(nSec));
+                        }
                         ImPlot::EndPlot();
                     }
                     ImGui::SameLine();
                     if (ImPlot::BeginPlot("Drag Polar (CD vs CL)", ImVec2(plotW, plotH))) {
                         ImPlot::SetupAxes("Total Drag CD", "Lift Coefficient CL");
                         ImPlot::SetupLegend(ImPlotLocation_SouthEast);
-                        ImPlot::PlotLine("Drag Polar (CD vs CL)", cds.data(), cls.data(), static_cast<int>(n));
-                        ImPlot::PlotScatter("Data Points", cds.data(), cls.data(), static_cast<int>(n));
-                        ImPlot::PlotLine("Induced Drag CDi", cdis.data(), cls.data(), static_cast<int>(n));
+                        if (show3D && n3D > 0) {
+                            ImPlot::PlotLine("3D Whole Model Polar", cds3D.data(), cls3D.data(), static_cast<int>(n3D));
+                            ImPlot::PlotScatter("##3d_cd_pts", cds3D.data(), cls3D.data(), static_cast<int>(n3D));
+                            if (app.polarScopeMode == 0) {
+                                ImPlot::PlotLine("3D Induced Drag CDi", cdis3D.data(), cls3D.data(), static_cast<int>(n3D));
+                            }
+                        }
+                        if (showSec && nSec > 0) {
+                            ImPlot::PlotLine("Active Y-Slice Section Polar", cdsSec.data(), clsSec.data(), static_cast<int>(nSec));
+                            ImPlot::PlotScatter("##sec_cd_pts", cdsSec.data(), clsSec.data(), static_cast<int>(nSec));
+                        }
                         ImPlot::EndPlot();
                     }
                     ImGui::EndTabItem();
@@ -3972,37 +4198,136 @@ void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
                 if (ImGui::BeginTabItem("Glide Ratio & Moment")) {
                     float availW = ImGui::GetContentRegionAvail().x;
                     float plotW = std::max(280.0f, (availW - 16.0f) * 0.5f);
-                    float plotH = std::max(280.0f, ImGui::GetContentRegionAvail().y - 10.0f);
+                    float plotH = std::max(260.0f, ImGui::GetContentRegionAvail().y - 10.0f);
 
                     if (ImPlot::BeginPlot("Glide Ratio (L/D vs Alpha)", ImVec2(plotW, plotH))) {
                         ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Lift-to-Drag Ratio L/D");
                         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
-                        ImPlot::PlotLine("L/D Ratio", alphas.data(), lds.data(), static_cast<int>(n));
-                        ImPlot::PlotScatter("Points", alphas.data(), lds.data(), static_cast<int>(n));
+                        if (show3D && n3D > 0) {
+                            ImPlot::PlotLine("3D Whole Model L/D", alphas3D.data(), lds3D.data(), static_cast<int>(n3D));
+                            ImPlot::PlotScatter("##3d_ld_pts", alphas3D.data(), lds3D.data(), static_cast<int>(n3D));
+                        }
+                        if (showSec && nSec > 0) {
+                            ImPlot::PlotLine("Active Y-Slice Section l/d", alphasSec.data(), ldsSec.data(), static_cast<int>(nSec));
+                            ImPlot::PlotScatter("##sec_ld_pts", alphasSec.data(), ldsSec.data(), static_cast<int>(nSec));
+                        }
                         ImPlot::EndPlot();
                     }
                     ImGui::SameLine();
                     if (ImPlot::BeginPlot("Pitching Moment (CM vs Alpha)", ImVec2(plotW, plotH))) {
                         ImPlot::SetupAxes("Angle of Attack Alpha (deg)", "Pitching Moment CM (c/4)");
                         ImPlot::SetupLegend(ImPlotLocation_NorthEast);
-                        ImPlot::PlotLine("CM (c/4)", alphas.data(), cms.data(), static_cast<int>(n));
-                        ImPlot::PlotScatter("Points", alphas.data(), cms.data(), static_cast<int>(n));
+                        if (show3D && n3D > 0) {
+                            ImPlot::PlotLine("3D Whole Model CM", alphas3D.data(), cms3D.data(), static_cast<int>(n3D));
+                            ImPlot::PlotScatter("##3d_cm_pts", alphas3D.data(), cms3D.data(), static_cast<int>(n3D));
+                        }
+                        if (showSec && nSec > 0) {
+                            ImPlot::PlotLine("Active Y-Slice Section cm", alphasSec.data(), cmsSec.data(), static_cast<int>(nSec));
+                            ImPlot::PlotScatter("##sec_cm_pts", alphasSec.data(), cmsSec.data(), static_cast<int>(nSec));
+                        }
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Slice Airfoil & Span Load")) {
+                    float availW = ImGui::GetContentRegionAvail().x;
+                    float plotW = std::max(280.0f, (availW - 16.0f) * 0.5f);
+                    float plotH = std::max(260.0f, ImGui::GetContentRegionAvail().y - 10.0f);
+
+                    // Left Plot: 1:1 Aspect-Locked 2D Airfoil Cross-Section at Active Y-Slice
+                    if (ImPlot::BeginPlot("Active Y-Slice Airfoil Profile (mm)", ImVec2(plotW, plotH), ImPlotFlags_Equal)) {
+                        ImPlot::SetupAxes("Chord X from Leading Edge (mm)", "Thickness / Height Z (mm)");
+                        ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+                        if (app.sectionPolarResult.valid && !app.sectionPolarResult.profile.empty()) {
+                            const auto& prof = app.sectionPolarResult.profile;
+                            size_t mCount = prof.size();
+                            std::vector<float> px(mCount), zUp(mCount), zLo(mCount), zCam(mCount), zChd(mCount);
+                            for (size_t i = 0; i < mCount; ++i) {
+                                px[i] = prof[i].xMm;
+                                zUp[i] = prof[i].zUpperMm;
+                                zLo[i] = prof[i].zLowerMm;
+                                zCam[i] = prof[i].zCamberMm;
+                                zChd[i] = prof[i].zChordMm;
+                            }
+                            ImPlot::PlotLine("Upper Surface", px.data(), zUp.data(), static_cast<int>(mCount));
+                            ImPlot::PlotLine("Lower Surface", px.data(), zLo.data(), static_cast<int>(mCount));
+                            ImPlot::PlotLine("Mean Camber Line", px.data(), zCam.data(), static_cast<int>(mCount));
+                            ImPlot::PlotLine("Chord Line", px.data(), zChd.data(), static_cast<int>(mCount));
+                        }
+                        ImPlot::EndPlot();
+                    }
+                    ImGui::SameLine();
+
+                    // Right Plot: Spanwise Lift Distribution with Interactive Active Slice Drag Line
+                    if (ImPlot::BeginPlot("Spanwise Lift Distribution (cl vs Span Y)", ImVec2(plotW, plotH))) {
+                        ImPlot::SetupAxes("Spanwise Station Y (mm)", "Local Lift Coefficient cl(y)");
+                        ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+                        if (!res3D.spanStations.empty()) {
+                            size_t sCount = res3D.spanStations.size();
+                            std::vector<float> sy(sCount), scl(sCount), sellip(sCount);
+                            float yGridSum = 0.0f, yMmSum = 0.0f;
+                            for (size_t i = 0; i < sCount; ++i) {
+                                sy[i] = res3D.spanStations[i].yMm;
+                                scl[i] = res3D.spanStations[i].clLocal;
+                                sellip[i] = res3D.spanStations[i].clElliptic;
+                                yGridSum += res3D.spanStations[i].yGrid;
+                                yMmSum += res3D.spanStations[i].yMm;
+                            }
+                            ImPlot::PlotLine("3D Spanwise cl(y)", sy.data(), scl.data(), static_cast<int>(sCount));
+                            ImPlot::PlotLine("Ideal Elliptical Load", sy.data(), sellip.data(), static_cast<int>(sCount));
+
+                            // Interactive vertical line showing and controlling the Active Y-Slice station
+                            float yCenterGrid = (yGridSum / static_cast<float>(sCount)) -
+                                                (yMmSum / static_cast<float>(sCount)) / std::max(1e-4f, app.voxelGrid.cellSize);
+                            double sliceYMm = (static_cast<double>(yPlane.index) - static_cast<double>(yCenterGrid)) *
+                                              static_cast<double>(app.voxelGrid.cellSize);
+                            if (ImPlot::DragLineX(0, &sliceYMm, ImVec4(1.0f, 0.85f, 0.2f, 1.0f), 2.0f)) {
+                                int newIdx = static_cast<int>(std::round(sliceYMm / std::max(1e-4f, app.voxelGrid.cellSize) + yCenterGrid));
+                                newIdx = std::clamp(newIdx, 0, sliceMaxY);
+                                if (newIdx != yPlane.index) {
+                                    yPlane.index = newIdx;
+                                    yPlane.indexAtomic.store(yPlane.index, std::memory_order_relaxed);
+                                    if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::Slice && yPlane.enabled) {
+                                        StartResliceTask(app);
+                                    }
+                                }
+                            }
+                        }
                         ImPlot::EndPlot();
                     }
                     ImGui::EndTabItem();
                 }
 
                 if (ImGui::BeginTabItem("Data Table & Export")) {
+                    ImGui::TextUnformatted("Table Source:");
+                    ImGui::SameLine();
+                    ImGui::RadioButton("3D Whole Model##tbl", &app.polarTableSource, 0);
+                    ImGui::SameLine();
+                    ImGui::RadioButton("Active Y-Slice Section##tbl", &app.polarTableSource, 1);
+                    ImGui::SameLine(0.0f, 20.0f);
+
+                    const PanelSolver::PolarSweepResult& activeRes =
+                        (app.polarTableSource == 1 && app.sectionPolarResult.valid) ? app.sectionPolarResult.polar : app.polarResult;
+
                     if (ImGui::Button("Export Polar to CSV (polar.csv)")) {
                         FILE* f = std::fopen("polar.csv", "w");
                         if (f) {
-                            std::fprintf(f, "# FlowCraft Aero Polar Sweep (XFLR5-Style)\n");
-                            std::fprintf(f, "# S = %.6f m2, Mean Chord = %.6f m, Span = %.6f m, AR = %.3f\n",
-                                         res.refAreaM2, res.refChordM, res.refSpanM, res.aspectRatio);
+                            if (app.polarTableSource == 1 && app.sectionPolarResult.valid) {
+                                const auto& sec = app.sectionPolarResult;
+                                std::fprintf(f, "# FlowCraft 2D Active Slice Section Polar (Y = %.2f mm)\n", sec.spanPosMm);
+                                std::fprintf(f, "# Local Chord = %.2f mm, t/c = %.2f%%, Camber = %.2f%%, Twist = %.2f deg, Re = %.0f\n",
+                                             sec.localChordMm, sec.maxThicknessRatio * 100.0f, sec.maxCamberRatio * 100.0f,
+                                             sec.localTwistDeg, sec.reynoldsNumber);
+                            } else {
+                                std::fprintf(f, "# FlowCraft 3D Whole-Model Aero Polar Sweep (XFLR5-Style)\n");
+                                std::fprintf(f, "# S = %.6f m2, Mean Chord = %.6f m, Span = %.6f m, AR = %.3f\n",
+                                             activeRes.refAreaM2, activeRes.refChordM, activeRes.refSpanM, activeRes.aspectRatio);
+                            }
                             std::fprintf(f, "# CL_alpha = %.4f /deg, alpha_0 = %.3f deg, max(L/D) = %.2f @ %.1f deg\n",
-                                         res.clAlphaPerDeg, res.alphaZeroLiftDeg, res.maxLD, res.alphaAtMaxLD);
+                                         activeRes.clAlphaPerDeg, activeRes.alphaZeroLiftDeg, activeRes.maxLD, activeRes.alphaAtMaxLD);
                             std::fprintf(f, "Alpha_deg,CL,CD,CDi,CD0,L_over_D,CM_c4,Lift_N,Drag_N,CoP_X_mm\n");
-                            for (const auto& pt : res.points) {
+                            for (const auto& pt : activeRes.points) {
                                 std::fprintf(f, "%.2f,%.5f,%.5f,%.5f,%.5f,%.3f,%.5f,%.4f,%.4f,%.2f\n",
                                              pt.alphaDeg, pt.cl, pt.cd, pt.cdi, pt.cd0, pt.ld, pt.cm,
                                              pt.liftN, pt.dragN, pt.cpX_mm);
@@ -4033,7 +4358,7 @@ void DrawAeroPolarsWindow(AppState& app, float topInset = 0.0f) {
                         ImGui::TableSetupColumn("CoP X (mm)");
                         ImGui::TableHeadersRow();
 
-                        for (const auto& pt : res.points) {
+                        for (const auto& pt : activeRes.points) {
                             ImGui::TableNextRow();
                             ImGui::TableSetColumnIndex(0); ImGui::Text("%.1f deg", pt.alphaDeg);
                             ImGui::TableSetColumnIndex(1); ImGui::Text("%.4f", pt.cl);
@@ -7263,6 +7588,9 @@ int main(int, char**) {
             app.lbmValid = false;
             app.lbmRunning = false;
             app.overlayValid = false;
+            app.polarResult = {};
+            app.sectionPolarResult = {};
+            app.panelSolver.Shutdown();
             // Every plane's index defaulted to the *new* grid's own center
             // right here, immediately — both the plain field and its
             // atomic mirror — rather than left at -1 for DrawUI's own
