@@ -243,6 +243,16 @@ struct AppState {
     OrbitCamera camera;
     bool draggingCamera = false;
 
+    // Smooth camera transition state (glides smoothly to Front, Top, Right, Left, Iso, etc.)
+    bool cameraSmoothTransitions = true;
+    bool cameraTransitioning = false;
+    float cameraTransitionStartYaw = 0.0f;
+    float cameraTransitionStartPitch = 0.0f;
+    float cameraTransitionTargetYaw = 0.0f;
+    float cameraTransitionTargetPitch = 0.0f;
+    float cameraTransitionProgress = 0.0f;
+    float cameraTransitionDuration = 0.35f; // 350 ms CAD-style smooth transition
+
     // Slice drag handles (3D view, Slice style only) — grabbing one of the
     // three little axis arrows at the slice plane's center both selects
     // that axis (if it wasn't already) and drags the slice position along
@@ -937,9 +947,68 @@ void RotateModel(AppState& app, const Vec3& axis, float radians) {
     app.modelOrientation = Mat4::RotationAxisAngle(axis, radians) * app.modelOrientation;
 }
 
-void SnapCameraView(AppState& app, float yaw, float pitch) {
-    app.camera.yaw = yaw;
-    app.camera.pitch = pitch;
+bool TryFastReslice(AppState& app);
+
+void SnapCameraView(AppState& app, float targetYaw, float targetPitch, bool animated = true) {
+    if (!app.cameraSmoothTransitions || !animated) {
+        app.cameraTransitioning = false;
+        app.camera.yaw = targetYaw;
+        app.camera.pitch = targetPitch;
+        return;
+    }
+
+    constexpr float kPi = std::numbers::pi_v<float>;
+    constexpr float kTwoPi = 2.0f * kPi;
+    float deltaYaw = targetYaw - app.camera.yaw;
+    while (deltaYaw > kPi) deltaYaw -= kTwoPi;
+    while (deltaYaw < -kPi) deltaYaw += kTwoPi;
+
+    if (std::abs(deltaYaw) < 1e-4f && std::abs(targetPitch - app.camera.pitch) < 1e-4f) {
+        app.cameraTransitioning = false;
+        app.camera.yaw = targetYaw;
+        app.camera.pitch = targetPitch;
+        return;
+    }
+
+    app.cameraTransitioning = true;
+    app.cameraTransitionProgress = 0.0f;
+    app.cameraTransitionDuration = 0.35f;
+    app.cameraTransitionStartYaw = app.camera.yaw;
+    app.cameraTransitionStartPitch = app.camera.pitch;
+    app.cameraTransitionTargetYaw = app.camera.yaw + deltaYaw;
+    app.cameraTransitionTargetPitch = targetPitch;
+}
+
+void UpdateCameraTransition(AppState& app, float dt) {
+    if (!app.cameraTransitioning) return;
+
+    float safeDt = std::clamp(dt, 0.0f, 0.1f);
+    app.cameraTransitionProgress += safeDt / std::max(1e-3f, app.cameraTransitionDuration);
+
+    constexpr float kPi = std::numbers::pi_v<float>;
+    constexpr float kTwoPi = 2.0f * kPi;
+
+    if (app.cameraTransitionProgress >= 1.0f) {
+        app.cameraTransitionProgress = 1.0f;
+        app.cameraTransitioning = false;
+        app.camera.yaw = app.cameraTransitionTargetYaw;
+        app.camera.pitch = app.cameraTransitionTargetPitch;
+        while (app.camera.yaw > kPi) app.camera.yaw -= kTwoPi;
+        while (app.camera.yaw < -kPi) app.camera.yaw += kTwoPi;
+    } else {
+        float t = app.cameraTransitionProgress;
+        // Quintic smootherstep (6t^5 - 15t^4 + 10t^3) for zero jerk and silky ease-in / ease-out
+        float ease = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+        app.camera.yaw = app.cameraTransitionStartYaw +
+                         (app.cameraTransitionTargetYaw - app.cameraTransitionStartYaw) * ease;
+        app.camera.pitch = app.cameraTransitionStartPitch +
+                           (app.cameraTransitionTargetPitch - app.cameraTransitionStartPitch) * ease;
+    }
+
+    if (app.viewMode == ViewMode::FlowOverlay &&
+        (app.overlayStyle == OverlayStyle::VoxelCloud || app.overlayStyle == OverlayStyle::Raymarch)) {
+        TryFastReslice(app);
+    }
 }
 
 // Keeps the camera's near/far clip margin sized to the model's *current*
@@ -2642,6 +2711,7 @@ void LoadMeshFromDialog(AppState& app) {
     app.meshLoaded = true;
     app.renderer.UploadMesh(app.mesh);
     app.camera.Frame(app.mesh.bounds);
+    app.cameraTransitioning = false;
     app.modelOrientation = app.lockedOrientation;  // see its own comment — identity until ever locked
     app.modelPivot = app.mesh.bounds.Center();
     app.scaleMM = 1.0f;
@@ -2784,6 +2854,7 @@ void ApplySessionSettings(AppState& app, const SessionSettings& s) {
     app.camera.yaw = s.cameraYaw;
     app.camera.pitch = s.cameraPitch;
     app.camera.distance = s.cameraDistance;
+    app.cameraTransitioning = false;
 }
 
 void SaveSessionDialog(AppState& app) {
@@ -2828,7 +2899,8 @@ void LoadSessionDialog(AppState& app) {
     app.meshStlBytes = std::move(result.stlBytes);
     app.meshLoaded = true;
     app.renderer.UploadMesh(app.mesh);
-    app.camera.Frame(app.mesh.bounds);  // seeds target/sceneRadius from the (new) mesh bounds first...
+    app.camera.Frame(app.mesh.bounds);
+    app.cameraTransitioning = false;  // seeds target/sceneRadius from the (new) mesh bounds first...
 
     // ResetStateForNewMesh resets each slice plane's index to -1 among
     // other things, so it must run BEFORE ApplySessionSettings, which
@@ -2907,7 +2979,8 @@ constexpr float kGizmoCenterInset = 70.0f;
 constexpr float kGizmoBottomInset = kGizmoCenterInset + kGizmoRadius + kGizmoBackdropPad;
 constexpr float kGizmoRightMargin = kGizmoCenterInset - (kGizmoRadius + kGizmoBackdropPad);
 
-void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
+void DrawOrientationGizmo(AppState& app, float topInset = 0.0f) {
+    const OrbitCamera& camera = app.camera;
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float radius = kGizmoRadius;
     const ImVec2 center{viewport->Pos.x + viewport->Size.x - kGizmoCenterInset,
@@ -2921,6 +2994,7 @@ void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
         Vec3 dir;
         ImU32 color;
         const char* label;
+        int axisIndex;
     };
     // "Flow" is drawn along kPitchAxis (world Y) now, not kFlowAxis (world
     // X) — the solver's actual inlet/outlet axis moved to world Y (see
@@ -2930,9 +3004,9 @@ void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
     // Pitch rotates around) — just no longer the one worth calling
     // "Flow" here, so it gets the plain axis-letter label instead.
     const std::array<AxisDef, 3> axes = {{
-        {kPitchAxis, IM_COL32(235, 90, 90, 255), "Flow"},
-        {kYawAxis, IM_COL32(100, 150, 235, 255), "Z"},
-        {kFlowAxis, IM_COL32(100, 210, 100, 255), "X"},
+        {kPitchAxis, IM_COL32(235, 90, 90, 255), "Flow", 0},
+        {kYawAxis, IM_COL32(100, 150, 235, 255), "Z", 1},
+        {kFlowAxis, IM_COL32(100, 210, 100, 255), "X", 2},
     }};
 
     struct AxisEnd {
@@ -2941,6 +3015,7 @@ void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
         ImU32 color;
         const char* label;
         bool positive;
+        int axisIndex;
     };
     std::array<AxisEnd, 6> ends;
     size_t n = 0;
@@ -2949,18 +3024,65 @@ void DrawOrientationGizmo(const OrbitCamera& camera, float topInset = 0.0f) {
             Vec3 e = a.dir * sign;
             Vec3 v{Dot(basis.right, e), Dot(basis.up, e), Dot(basis.forward, e)};
             ImVec2 p{center.x + v.x * radius, center.y - v.y * radius};
-            ends[n++] = {p, v.z, a.color, a.label, sign > 0.0f};
+            ends[n++] = {p, v.z, a.color, a.label, sign > 0.0f, a.axisIndex};
         }
     }
     std::sort(ends.begin(), ends.end(), [](const AxisEnd& a, const AxisEnd& b) { return a.depth > b.depth; });
 
-    for (const AxisEnd& end : ends) {
-        dl->AddLine(center, end.pos, end.color, 2.0f);
+    ImVec2 mousePos = ImGui::GetIO().MousePos;
+    bool mouseClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    int hoveredIdx = -1;
+    for (int i = 5; i >= 0; --i) {
+        float dx = mousePos.x - ends[i].pos.x;
+        float dy = mousePos.y - ends[i].pos.y;
+        float hitR = ends[i].positive ? 12.0f : 9.0f;
+        if (dx * dx + dy * dy <= hitR * hitR) {
+            hoveredIdx = i;
+            break;
+        }
+    }
+
+    if (hoveredIdx >= 0 && mouseClicked && !ImGui::GetIO().WantCaptureMouseUnlessPopupClose) {
+        const AxisEnd& clicked = ends[hoveredIdx];
+        bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
+        if (clicked.axisIndex == 0) { // Flow
+            if (clicked.positive) {
+                SnapCameraView(app, reverseFlow ? kQuarterTurnRadians : -kQuarterTurnRadians, 0.0f);
+            } else {
+                SnapCameraView(app, reverseFlow ? -kQuarterTurnRadians : kQuarterTurnRadians, 0.0f);
+            }
+        } else if (clicked.axisIndex == 1) { // Z (Up)
+            if (clicked.positive) {
+                SnapCameraView(app, 0.0f, kTopViewPitch);
+            } else {
+                SnapCameraView(app, 0.0f, -kTopViewPitch);
+            }
+        } else if (clicked.axisIndex == 2) { // X (Lateral)
+            if (clicked.positive) {
+                SnapCameraView(app, 0.0f, 0.0f);
+            } else {
+                SnapCameraView(app, std::numbers::pi_v<float>, 0.0f);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < ends.size(); ++i) {
+        const AxisEnd& end = ends[i];
+        bool isHovered = (static_cast<int>(i) == hoveredIdx);
+        dl->AddLine(center, end.pos, end.color, isHovered ? 2.6f : 2.0f);
         if (end.positive) {
-            dl->AddCircleFilled(end.pos, 6.0f, end.color);
+            float rDot = isHovered ? 8.0f : 6.0f;
+            dl->AddCircleFilled(end.pos, rDot, end.color);
+            if (isHovered) {
+                dl->AddCircle(end.pos, rDot + 2.5f, IM_COL32(255, 255, 255, 220), 16, 1.5f);
+            }
             dl->AddText(ImVec2(end.pos.x + 7.0f, end.pos.y - 7.0f), IM_COL32(235, 235, 235, 255), end.label);
         } else {
-            dl->AddCircle(end.pos, 4.0f, end.color, 12, 1.5f);
+            float rDot = isHovered ? 6.0f : 4.0f;
+            dl->AddCircle(end.pos, rDot, end.color, 12, isHovered ? 2.0f : 1.5f);
+            if (isHovered) {
+                dl->AddCircle(end.pos, rDot + 2.0f, IM_COL32(255, 255, 255, 220), 12, 1.0f);
+            }
         }
     }
 }
@@ -3952,6 +4074,7 @@ enum class RibbonIcon {
     CamTop,
     CamRight,
     CamLeft,
+    CamIso,
     Voxelize,
     InitSolver,
     Play,
@@ -4098,6 +4221,26 @@ void DrawRibbonVectorIcon(ImDrawList* dl, ImVec2 center, float radius, RibbonIco
                 dl->AddRectFilled(ImVec2(tl.x + 2.0f, tl.y + 2.0f), ImVec2(center.x - s * 0.15f, br.y - 2.0f),
                                   accentCol, 1.0f);
             }
+            break;
+        }
+        case RibbonIcon::CamIso: {
+            // Isometric 3D box outline with top face shaded
+            float s = r * 0.72f;
+            float dx = s * 0.866f;
+            float dy = s * 0.5f;
+            ImVec2 c = center;
+            ImVec2 pTop{c.x, c.y - s};
+            ImVec2 pTopR{c.x + dx, c.y - dy * 0.5f};
+            ImVec2 pBotR{c.x + dx, c.y + dy * 0.5f + s * 0.35f};
+            ImVec2 pBot{c.x, c.y + s * 0.85f};
+            ImVec2 pBotL{c.x - dx, c.y + dy * 0.5f + s * 0.35f};
+            ImVec2 pTopL{c.x - dx, c.y - dy * 0.5f};
+            ImVec2 pMid{c.x, c.y};
+
+            dl->AddQuad(pTop, pTopR, pMid, pTopL, primaryCol, 1.5f);
+            dl->AddQuadFilled(pTop, pTopR, pMid, pTopL, accentCol);
+            dl->AddQuad(pMid, pTopR, pBotR, pBot, primaryCol, 1.5f);
+            dl->AddQuad(pMid, pBot, pBotL, pTopL, primaryCol, 1.5f);
             break;
         }
         case RibbonIcon::InitSolver: {
@@ -4544,6 +4687,12 @@ void DrawFusionRibbon(AppState& app, bool busy) {
                              "Snap camera to Left profile view.", 46.0f)) {
             SnapCameraView(app, std::numbers::pi_v<float>, 0.0f);
         }
+        ImGui::SameLine(0.0f, 2.0f);
+        if (RibbonIconButton("##rib_ciso", "Iso", RibbonIcon::CamIso, false, app.meshLoaded,
+                             "Snap camera to 3D Isometric perspective view.", 46.0f)) {
+            bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
+            SnapCameraView(app, reverseFlow ? (kQuarterTurnRadians * 0.5f) : (-kQuarterTurnRadians * 0.5f), 0.55f);
+        }
 
         DrawRibbonDivider();
 
@@ -4936,10 +5085,34 @@ void DrawFusionInspector(AppState& app, bool busy) {
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("Orbit Camera");
+            ImGui::TextDisabled("Camera View (Snap & Smooth Glide)");
+            bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
+            if (ImGui::Button("Front##insp")) {
+                SnapCameraView(app, reverseFlow ? kQuarterTurnRadians : -kQuarterTurnRadians, 0.0f);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Back##insp")) {
+                SnapCameraView(app, reverseFlow ? -kQuarterTurnRadians : kQuarterTurnRadians, 0.0f);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Top##insp")) SnapCameraView(app, 0.0f, kTopViewPitch);
+            ImGui::SameLine();
+            if (ImGui::Button("Bottom##insp")) SnapCameraView(app, 0.0f, -kTopViewPitch);
+            ImGui::SameLine();
+            if (ImGui::Button("Right##insp")) SnapCameraView(app, 0.0f, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("Left##insp")) SnapCameraView(app, std::numbers::pi_v<float>, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("Iso##insp")) {
+                SnapCameraView(app, reverseFlow ? (kQuarterTurnRadians * 0.5f) : (-kQuarterTurnRadians * 0.5f), 0.55f);
+            }
+
+            ImGui::Checkbox("Smooth Transitions", &app.cameraSmoothTransitions);
+            ImGui::SameLine();
             ImGui::Checkbox("Invert X", &app.camera.invertX);
             ImGui::SameLine();
             ImGui::Checkbox("Invert Y", &app.camera.invertY);
+            ImGui::SameLine();
             ImGui::Checkbox("Invert Scroll Zoom", &app.camera.invertScrollZoom);
         } else if (app.activeTab == WorkspaceTab::Voxelize) {
             ImGui::BeginDisabled(busy);
@@ -5470,7 +5643,7 @@ void DrawUI(AppState& app) {
         DrawTelemetryHud(app, kFusionRibbonHeight);
 
         if (app.meshLoaded) {
-            DrawOrientationGizmo(app.camera, kFusionRibbonHeight);
+            DrawOrientationGizmo(app, kFusionRibbonHeight);
             DrawScaleRuler(app);
             DrawLiftArrow(app);
             if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::Slice) {
@@ -5629,38 +5802,28 @@ void DrawUI(AppState& app) {
         ImGui::Text("Scaled size: %.3f x %.3f x %.3f mm", scaledSize.x, scaledSize.y, scaledSize.z);
 
         ImGui::Separator();
-        ImGui::TextUnformatted("View");
+        ImGui::TextUnformatted("View (Snap & Smooth Glide)");
+        bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
         if (ImGui::Button("Front")) {
-            // Flips with Flow direction (reverseFlow) so "Front" always
-            // shows the model nose-on rather than hardcoding one
-            // direction's answer and silently showing the back for the
-            // other. Both branches pinned to the user's own direct
-            // report each time (this file's own hand-derived math for
-            // "which yaw shows which face" has been wrong more than
-            // once — it's self-consistent about forward/right/up, but
-            // that's not the same as matching reverseFlow's own notion
-            // of which face is the nose) — this is the opposite of the
-            // previous guess: with reverseFlow at its current default
-            // (false), yaw=+90° is the nose-on view, not -90°.
-            bool reverseFlow = app.lbmReverseFlowAtomic.load(std::memory_order_relaxed);
             SnapCameraView(app, reverseFlow ? kQuarterTurnRadians : -kQuarterTurnRadians, 0.0f);
         }
         ImGui::SameLine();
-        // Shifted +90° (yaw=0 instead of -kQuarterTurnRadians) from an
-        // earlier guess that just copied Front's own yaw — per the
-        // user's direct report, that showed the nose rotated 90° off
-        // from correct looking straight down, not pinned re-derived
-        // from Eye()'s formula (see Front's own comment on why that's
-        // not trusted here).
+        if (ImGui::Button("Back")) {
+            SnapCameraView(app, reverseFlow ? -kQuarterTurnRadians : kQuarterTurnRadians, 0.0f);
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Top")) SnapCameraView(app, 0.0f, kTopViewPitch);
         ImGui::SameLine();
-        // Right/Left are the lateral side views, perpendicular to Front
-        // — see Front's own comment on why these are the user-confirmed
-        // angles (each shifted -90° from this file's last guess) rather
-        // than re-derived from Eye()'s formula directly.
+        if (ImGui::Button("Bottom")) SnapCameraView(app, 0.0f, -kTopViewPitch);
+        ImGui::SameLine();
         if (ImGui::Button("Right")) SnapCameraView(app, 0.0f, 0.0f);
         ImGui::SameLine();
         if (ImGui::Button("Left")) SnapCameraView(app, std::numbers::pi_v<float>, 0.0f);
+        ImGui::SameLine();
+        if (ImGui::Button("Iso")) {
+            SnapCameraView(app, reverseFlow ? (kQuarterTurnRadians * 0.5f) : (-kQuarterTurnRadians * 0.5f), 0.55f);
+        }
+        ImGui::Checkbox("Smooth Transitions", &app.cameraSmoothTransitions);
 
         ImGui::Separator();
         ImGui::Text("Orientation (relative to flow, +Y)");
@@ -6837,7 +7000,7 @@ void DrawUI(AppState& app) {
     ImGui::End();
 
     if (app.meshLoaded) {
-        DrawOrientationGizmo(app.camera);
+        DrawOrientationGizmo(app);
         DrawScaleRuler(app);
         DrawLiftArrow(app);
         if (app.viewMode == ViewMode::FlowOverlay && app.overlayStyle == OverlayStyle::Slice) {
@@ -6989,6 +7152,7 @@ int main(int, char**) {
                         app.sliceDragFractionalCells = 0.0f;
                     } else {
                         app.draggingCamera = true;
+                        app.cameraTransitioning = false;
                     }
                 }
                 if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
@@ -6998,6 +7162,7 @@ int main(int, char**) {
                 if (event.type == SDL_EVENT_MOUSE_MOTION && app.draggingSliceHandle) {
                     ApplySliceHandleDrag(app, event.motion.xrel, event.motion.yrel);
                 } else if (event.type == SDL_EVENT_MOUSE_MOTION && app.draggingCamera) {
+                    app.cameraTransitioning = false;
                     app.camera.OnDrag(event.motion.xrel, event.motion.yrel);
                     Vec3 forward = app.camera.GetBasis().forward;
                     app.cameraForwardXAtomic.store(forward.x, std::memory_order_relaxed);
@@ -7030,6 +7195,7 @@ int main(int, char**) {
         float dt = static_cast<float>(nowTicks - lastTicks) / 1000.0f;
         lastTicks = nowTicks;
         PollKeyboardRotation(app, dt);
+        UpdateCameraTransition(app, dt);
         UpdateSceneRadiusForScale(app);
 
         // The solver thread (or a Build-Overlay task thread) already did
