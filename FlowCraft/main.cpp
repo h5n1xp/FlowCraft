@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -277,6 +278,18 @@ struct AppState {
     // frame) since it's a non-trivial CPU pass — press "Voxelize" to
     // snapshot the current orientation/scale into a grid.
     VoxelGrid voxelGrid;
+    // Guards voxelGrid itself against being replaced while a background
+    // thread is still reading it. The UI thread is the only writer (the
+    // main loop's "pending voxel result" block, and ResetVoxelization) and
+    // takes it exclusively just for the assignment; the background
+    // readers that can outlive a UI frame — BuildOverlayMeshFromField (on
+    // the overlay auto-update thread, which is NOT gated by the task
+    // "busy" flag and so can be mid-build when a re-voxelize lands) and
+    // InitLbmSolver — hold it shared for as long as they use the grid.
+    // The UI thread's own reads need no lock: it's the only writer.
+    // Never taken while holding lbmMutex/lastFieldMutex/overlayMeshMutex
+    // on the writer side, so there's no ordering to get wrong.
+    std::shared_mutex voxelGridMutex;
     std::atomic<bool> voxelGridValid{false};
     int voxelResolution = 640;
     // Extra empty domain around the model's extent, per axis, as a
@@ -336,6 +349,15 @@ struct AppState {
     // plain fields below; the UI thread refreshes them once per frame (see
     // the main loop, right after DrawUI).
     std::mutex lbmMutex;
+    // Bumped (under lbmMutex) whenever something other than StepSolverPaced
+    // replaces or advances lbmSolver's state — InitLbmSolver's Init/Reset,
+    // or the manual Step button's StepSolverLocked. StepSolverPaced drops
+    // lbmMutex between the Z-chunks of a substep, so either of those can
+    // run in the middle of one; it compares this against the value it saw
+    // when the substep began and abandons the substep (no AdvanceSubstep)
+    // if it changed, rather than finishing a half-written substep on top
+    // of state it didn't start from.
+    uint64_t lbmSolverEpoch = 0;
     LbmSolver lbmSolver;
     LbmReference lbmReference;        // CPU LBM backend — see SolverBackend's comment
     PotentialFlowSolver potentialFlow;  // Naive backend — see SolverBackend's comment
@@ -1116,11 +1138,17 @@ void FlagFlowDivergence(AppState& app) {
 
 void ResetVoxelization(AppState& app) {
     app.voxelGridValid = false;
-    app.voxelGrid = VoxelGrid{};
-    app.voxelSolidCount = 0;
-
+    // Stopped BEFORE the grid goes away, so the solver thread launches no
+    // further overlay updates against it; the exclusive lock then waits
+    // out any one still in flight — see voxelGridMutex's comment.
     app.lbmValid = false;
     app.lbmRunning = false;
+    {
+        std::unique_lock<std::shared_mutex> gridLock(app.voxelGridMutex);
+        app.voxelGrid = VoxelGrid{};
+    }
+    app.voxelSolidCount = 0;
+
     app.lbmForcesValidAtomic.store(false, std::memory_order_relaxed);
     app.overlayValid = false;
     ClearFlowDivergence(app);
@@ -1443,6 +1471,9 @@ void SyncLbmStatsAtomics(AppState& app) {
 // while tweaking tau (or the real inlet speed, which the solver doesn't
 // even see — see kLatticeVelocityScale) mid-run doesn't need it.
 void InitLbmSolver(AppState& app) {
+    // Held for the whole call (Init/warm start read app.voxelGrid
+    // throughout) — see voxelGridMutex's comment. Taken before lbmMutex.
+    std::shared_lock<std::shared_mutex> gridLock(app.voxelGridMutex);
     if (!app.voxelGridValid) return;
     if (IsGpuBackend(app.lbmBackend) && !app.gpuDevice) return;
     app.lbmParams.inletVelocity = kLatticeVelocityScale;
@@ -1452,6 +1483,7 @@ void InitLbmSolver(AppState& app) {
     // guards app.lbmInitError, read by the UI under the same lock (see
     // DrawUI) since this can now run on a background task thread.
     std::lock_guard<std::mutex> lock(app.lbmMutex);
+    ++app.lbmSolverEpoch;  // see its comment — tells a mid-substep StepSolverPaced to abandon that substep
 
     if (app.lbmBackend == SolverBackend::GPU) {
         app.lbmValid = app.lbmSolver.Init(app.gpuDevice, app.voxelGrid, app.lbmModel);
@@ -1741,6 +1773,12 @@ void LegendRangeForStyle(OverlayStyle style, FieldColorMode mode, bool sliceShow
 // than the one that owns them.
 void BuildOverlayMeshFromField(AppState& app, const std::vector<float>& field) {
     if (field.empty()) return;
+    // app.voxelGrid is read throughout, on a thread the UI's "busy" gating
+    // doesn't cover — see voxelGridMutex's comment. A field read back for
+    // a grid that has since been replaced (different size) is dropped
+    // outright rather than cached as lastField / published as forces.
+    std::shared_lock<std::shared_mutex> gridLock(app.voxelGridMutex);
+    if (field.size() != app.voxelGrid.CellCount() * 4) return;
 
     OverlayStyle style = static_cast<OverlayStyle>(app.overlayStyleAtomic.load(std::memory_order_relaxed));
     FieldColorMode mode = static_cast<FieldColorMode>(app.overlayColorModeAtomic.load(std::memory_order_relaxed));
@@ -2110,6 +2148,11 @@ void StepSolverLocked(AppState& app, int substeps) {
     bool diverged = false;
     {
         std::lock_guard<std::mutex> lock(app.lbmMutex);
+        // These are whole substeps, each rewriting the full domain, so if
+        // the solver thread is part-way through one of its own (the Step
+        // button is enabled while running) that partial substep is now
+        // stale — see lbmSolverEpoch's comment.
+        ++app.lbmSolverEpoch;
         SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(app.gpuDevice);
         app.lbmSolver.Step(cmd, substeps);
         SDL_SubmitGPUCommandBuffer(cmd);
@@ -2199,7 +2242,12 @@ void StepPanelLocked(AppState& app, int sweeps) {
 // their own — nothing else needs to block on this chunk's completion for
 // correctness, only for pacing, and that's this thread's own problem to
 // wait out, never the UI thread's.
-void StepSolverPaced(AppState& app, int substeps) {
+//
+// Returns how many substeps actually completed: fewer than `substeps` if
+// the flow diverged and auto-paused, or if the solver was re-initialized
+// or manually stepped from another thread part-way through a substep (see
+// AppState::lbmSolverEpoch) — that substep is abandoned, not counted.
+int StepSolverPaced(AppState& app, int substeps) {
     // static, not an AppState member: this function only ever runs on the
     // solver thread (see LbmWorkerThreadFunc), so there's no cross-thread
     // access to guard, and the adaptation should persist between calls.
@@ -2213,9 +2261,11 @@ void StepSolverPaced(AppState& app, int substeps) {
     app.lbmStepProgress.store(0.0f, std::memory_order_relaxed);
     for (int i = 0; i < substeps; ++i) {
         int nz;
+        uint64_t epoch;
         {
             std::lock_guard<std::mutex> lock(app.lbmMutex);
             nz = app.lbmSolver.Nz();
+            epoch = app.lbmSolverEpoch;
         }
 
         for (int zStart = 0; zStart < nz;) {
@@ -2236,6 +2286,10 @@ void StepSolverPaced(AppState& app, int substeps) {
             // assumption instead of relying on it.
             {
                 std::lock_guard<std::mutex> lock(app.lbmMutex);
+                // The chunks this substep already dispatched were computed
+                // from (and written into) state that has since been
+                // replaced — nothing here is worth finishing.
+                if (app.lbmSolverEpoch != epoch) return i;
                 SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(app.gpuDevice);
                 app.lbmSolver.StepRange(cmd, zStart, zCount);
                 SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
@@ -2287,6 +2341,10 @@ void StepSolverPaced(AppState& app, int substeps) {
         bool diverged = false;
         {
             std::lock_guard<std::mutex> lock(app.lbmMutex);
+            // Same check as each chunk's: flipping the ping-pong index
+            // here after an Init/Reset would make the freshly seeded
+            // solver's never-written buffer "current".
+            if (app.lbmSolverEpoch != epoch) return i;
             app.lbmSolver.AdvanceSubstep();
             if (doProbe && nz > 0) {
                 lastHealthProbeTicks = nowTicks;
@@ -2299,9 +2357,10 @@ void StepSolverPaced(AppState& app, int substeps) {
         }
         if (diverged) {
             FlagFlowDivergence(app);
-            if (!app.lbmRunning.load(std::memory_order_acquire)) break;
+            if (!app.lbmRunning.load(std::memory_order_acquire)) return i + 1;
         }
     }
+    return substeps;
 }
 
 // Paced equivalent of app.lbmSolver.ReadbackField(), for the GPU backend's
@@ -2431,8 +2490,9 @@ void LbmWorkerThreadFunc(AppState* appPtr) {
         if (valid && running) {
             int substeps = app.lbmSubstepsAtomic.load(std::memory_order_relaxed);
             SolverBackend backend = static_cast<SolverBackend>(app.lbmBackendAtomic.load(std::memory_order_relaxed));
+            int completed = substeps;
             if (backend == SolverBackend::GPU) {
-                StepSolverPaced(app, substeps);
+                completed = StepSolverPaced(app, substeps);
             } else if (backend == SolverBackend::CPU) {
                 StepReferenceLocked(app, substeps);
             } else if (IsPanelBackend(backend)) {
@@ -2440,7 +2500,9 @@ void LbmWorkerThreadFunc(AppState* appPtr) {
             } else {
                 StepPotentialFlowLocked(app, substeps);
             }
-            app.lbmStepCount += substeps;
+            // Only what actually ran — an Init/Reset that interrupted
+            // StepSolverPaced has already zeroed this for the new run.
+            app.lbmStepCount += completed;
 
             // warmedUp latches true forever once lbmStepCount (monotonic
             // while running, reset to 0 only by Initialize/Reset Solver)
@@ -6613,7 +6675,19 @@ int main(int, char**) {
         // is just a handful of field copies plus the (cheap, async)
         // voxelRenderer upload — never the slow part.
         uint64_t voxelVersion = app.voxelResultVersion.load(std::memory_order_acquire);
+        // The solver is stopped as soon as a new grid is waiting (it's
+        // about to be invalidated just below anyway), so the solver thread
+        // stops launching overlay updates; the swap itself then only
+        // happens on a frame where no background reader still holds the
+        // old grid — try_lock, so a long overlay build in flight delays
+        // the swap by a few frames instead of freezing the window. See
+        // voxelGridMutex's comment.
+        std::unique_lock<std::shared_mutex> voxelGridLock(app.voxelGridMutex, std::defer_lock);
         if (voxelVersion != app.voxelConsumedResultVersion) {
+            app.lbmValid = false;
+            app.lbmRunning = false;
+        }
+        if (voxelVersion != app.voxelConsumedResultVersion && voxelGridLock.try_lock()) {
             VoxelGrid grid;
             Mesh preview;
             size_t solidCount;
@@ -6624,6 +6698,7 @@ int main(int, char**) {
                 solidCount = app.pendingVoxelSolidCount;
             }
             app.voxelGrid = std::move(grid);
+            voxelGridLock.unlock();
             app.voxelSolidCount = solidCount;
             app.voxelRenderer.UploadMesh(preview);
             app.voxelGridValid = true;
