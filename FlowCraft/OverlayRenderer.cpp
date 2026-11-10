@@ -1,6 +1,7 @@
 #include "OverlayRenderer.h"
 #include "GpuShaders.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <vector>
@@ -137,9 +138,42 @@ void OverlayRenderer::Shutdown() {
     pipelineTransparent_ = nullptr;
 }
 
+namespace {
+
+// SDL_GPU buffer sizes are uint32, so no single vertex/index/transfer
+// buffer can exceed 4GiB. Both Upload* functions do their size arithmetic
+// in 64 bits and go through these, because doing it in uint32 wrapped
+// silently: a 3.85GiB vertex buffer's "+50% headroom" capacity overflowed
+// to 1.49GiB, the buffer was created at that size, and the full-size copy
+// into it then tripped Metal's validation (and would corrupt memory
+// without it).
+constexpr uint64_t kMaxGpuBufferBytes = UINT32_MAX;
+
+// True if a mesh with these byte sizes can be uploaded at all (vertex,
+// index, and the one transfer buffer holding both).
+bool MeshFitsGpuLimits(uint64_t vbBytes, uint64_t ibBytes) {
+    return vbBytes <= kMaxGpuBufferBytes && ibBytes <= kMaxGpuBufferBytes && vbBytes + ibBytes <= kMaxGpuBufferBytes;
+}
+
+// `bytes` plus 50% growth headroom, clamped to the per-buffer limit.
+uint32_t CapacityWithHeadroom(uint64_t bytes) {
+    return static_cast<uint32_t>(std::min(bytes + bytes / 2, kMaxGpuBufferBytes));
+}
+
+}  // namespace
+
 void OverlayRenderer::UploadMesh(const OverlayMesh& mesh) {
     indexCount_ = 0;
     if (mesh.vertices.empty()) return;
+
+    // Checked before the CPU-side copy below, which for a mesh this large
+    // would itself be several GiB.
+    if (!MeshFitsGpuLimits(static_cast<uint64_t>(mesh.vertices.size()) * sizeof(GpuVertex),
+                           static_cast<uint64_t>(mesh.indices.size()) * sizeof(uint32_t))) {
+        SDL_Log("OverlayRenderer: mesh too large to upload (%zu vertices, %zu indices) - not drawn.",
+                mesh.vertices.size(), mesh.indices.size());
+        return;
+    }
 
     std::vector<GpuVertex> gpuVerts(mesh.vertices.size());
     for (size_t i = 0; i < mesh.vertices.size(); ++i) {
@@ -156,35 +190,43 @@ void OverlayRenderer::UploadMesh(const OverlayMesh& mesh) {
     // stall this replaced) again.
     if (vbBytes > vertexCapacityBytes_) {
         if (vertexBuffer_) SDL_ReleaseGPUBuffer(device_, vertexBuffer_);
-        vertexCapacityBytes_ = vbBytes + vbBytes / 2;
+        vertexCapacityBytes_ = CapacityWithHeadroom(vbBytes);
         SDL_GPUBufferCreateInfo vbInfo = {};
         vbInfo.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
         vbInfo.size = vertexCapacityBytes_;
         vertexBuffer_ = SDL_CreateGPUBuffer(device_, &vbInfo);
+        if (!vertexBuffer_) vertexCapacityBytes_ = 0;
     }
     if (ibBytes > indexCapacityBytes_) {
         if (indexBuffer_) SDL_ReleaseGPUBuffer(device_, indexBuffer_);
-        indexCapacityBytes_ = ibBytes + ibBytes / 2;
+        indexCapacityBytes_ = CapacityWithHeadroom(ibBytes);
         SDL_GPUBufferCreateInfo ibInfo = {};
         ibInfo.usage = SDL_GPU_BUFFERUSAGE_INDEX;
         ibInfo.size = indexCapacityBytes_;
         indexBuffer_ = SDL_CreateGPUBuffer(device_, &ibInfo);
+        if (!indexBuffer_) indexCapacityBytes_ = 0;
     }
 
     uint32_t transferBytes = vbBytes + ibBytes;
     if (transferBytes > transferCapacityBytes_) {
         if (transfer_) SDL_ReleaseGPUTransferBuffer(device_, transfer_);
-        transferCapacityBytes_ = transferBytes + transferBytes / 2;
+        transferCapacityBytes_ = CapacityWithHeadroom(transferBytes);
         SDL_GPUTransferBufferCreateInfo tbInfo = {};
         tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
         tbInfo.size = transferCapacityBytes_;
         transfer_ = SDL_CreateGPUTransferBuffer(device_, &tbInfo);
+        if (!transfer_) transferCapacityBytes_ = 0;
+    }
+    if (!vertexBuffer_ || !indexBuffer_ || !transfer_) {
+        SDL_Log("OverlayRenderer: GPU buffer allocation failed: %s", SDL_GetError());
+        return;
     }
 
     // `cycle=true` — see UploadDynamicMesh's comment; this buffer is
     // rewritten far less often, but a reslice still right after the
     // previous one's draw is still in flight is possible.
     void* mapped = SDL_MapGPUTransferBuffer(device_, transfer_, true);
+    if (!mapped) return;
     std::memcpy(mapped, gpuVerts.data(), vbBytes);
     std::memcpy(static_cast<uint8_t*>(mapped) + vbBytes, mesh.indices.data(), ibBytes);
     SDL_UnmapGPUTransferBuffer(device_, transfer_);
@@ -210,6 +252,15 @@ void OverlayRenderer::UploadDynamicMesh(SDL_GPUCommandBuffer* cmd, const Overlay
     dynamicIndexCount_ = 0;
     if (mesh.vertices.empty()) return;
 
+    // Checked before the CPU-side copy below, which for a mesh this large
+    // would itself be several GiB.
+    if (!MeshFitsGpuLimits(static_cast<uint64_t>(mesh.vertices.size()) * sizeof(GpuVertex),
+                           static_cast<uint64_t>(mesh.indices.size()) * sizeof(uint32_t))) {
+        SDL_Log("OverlayRenderer: mesh too large to upload (%zu vertices, %zu indices) - not drawn.",
+                mesh.vertices.size(), mesh.indices.size());
+        return;
+    }
+
     std::vector<GpuVertex> gpuVerts(mesh.vertices.size());
     for (size_t i = 0; i < mesh.vertices.size(); ++i) {
         const OverlayVertex& v = mesh.vertices[i];
@@ -224,29 +275,36 @@ void OverlayRenderer::UploadDynamicMesh(SDL_GPUCommandBuffer* cmd, const Overlay
     // of them — once it settles, this never reallocates again.
     if (vbBytes > dynamicVertexCapacityBytes_) {
         if (dynamicVertexBuffer_) SDL_ReleaseGPUBuffer(device_, dynamicVertexBuffer_);
-        dynamicVertexCapacityBytes_ = vbBytes + vbBytes / 2;
+        dynamicVertexCapacityBytes_ = CapacityWithHeadroom(vbBytes);
         SDL_GPUBufferCreateInfo vbInfo = {};
         vbInfo.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
         vbInfo.size = dynamicVertexCapacityBytes_;
         dynamicVertexBuffer_ = SDL_CreateGPUBuffer(device_, &vbInfo);
+        if (!dynamicVertexBuffer_) dynamicVertexCapacityBytes_ = 0;
     }
     if (ibBytes > dynamicIndexCapacityBytes_) {
         if (dynamicIndexBuffer_) SDL_ReleaseGPUBuffer(device_, dynamicIndexBuffer_);
-        dynamicIndexCapacityBytes_ = ibBytes + ibBytes / 2;
+        dynamicIndexCapacityBytes_ = CapacityWithHeadroom(ibBytes);
         SDL_GPUBufferCreateInfo ibInfo = {};
         ibInfo.usage = SDL_GPU_BUFFERUSAGE_INDEX;
         ibInfo.size = dynamicIndexCapacityBytes_;
         dynamicIndexBuffer_ = SDL_CreateGPUBuffer(device_, &ibInfo);
+        if (!dynamicIndexBuffer_) dynamicIndexCapacityBytes_ = 0;
     }
 
     uint32_t transferBytes = vbBytes + ibBytes;
     if (transferBytes > dynamicTransferCapacityBytes_) {
         if (dynamicTransfer_) SDL_ReleaseGPUTransferBuffer(device_, dynamicTransfer_);
-        dynamicTransferCapacityBytes_ = transferBytes + transferBytes / 2;
+        dynamicTransferCapacityBytes_ = CapacityWithHeadroom(transferBytes);
         SDL_GPUTransferBufferCreateInfo tbInfo = {};
         tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
         tbInfo.size = dynamicTransferCapacityBytes_;
         dynamicTransfer_ = SDL_CreateGPUTransferBuffer(device_, &tbInfo);
+        if (!dynamicTransfer_) dynamicTransferCapacityBytes_ = 0;
+    }
+    if (!dynamicVertexBuffer_ || !dynamicIndexBuffer_ || !dynamicTransfer_) {
+        SDL_Log("OverlayRenderer: GPU buffer allocation failed: %s", SDL_GetError());
+        return;
     }
 
     // `cycle=true` on both the map and the upload tells SDL_GPU it may
@@ -255,6 +313,7 @@ void OverlayRenderer::UploadDynamicMesh(SDL_GPUCommandBuffer* cmd, const Overlay
     // this code having to track that with its own fences — the
     // documented pattern for a buffer that's rewritten every frame.
     void* mapped = SDL_MapGPUTransferBuffer(device_, dynamicTransfer_, true);
+    if (!mapped) return;
     std::memcpy(mapped, gpuVerts.data(), vbBytes);
     std::memcpy(static_cast<uint8_t*>(mapped) + vbBytes, mesh.indices.data(), ibBytes);
     SDL_UnmapGPUTransferBuffer(device_, dynamicTransfer_);

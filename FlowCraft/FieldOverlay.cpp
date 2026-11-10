@@ -2,6 +2,7 @@
 #include "MarchingCubesTables.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <thread>
 
@@ -815,85 +816,114 @@ OverlayMesh FieldOverlay::BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::
         return Vec3{gy, gx, gz};
     };
 
-    unsigned int numThreads = ParallelForZThreadCount(grid.nz - 1);
-    std::vector<OverlayMesh> partials(numThreads);
+    // An iso-surface's triangle count scales with the surface's AREA in
+    // cells, so at high grid resolution a convoluted one (a turbulent
+    // wake at a mid-range threshold) runs to hundreds of millions of
+    // vertices — several GiB, past SDL_GPU's 4GiB-per-buffer limit and
+    // far past anything worth rasterizing. Rather than build that and
+    // fail to upload it, each pass keeps a running vertex total across
+    // its threads and abandons the pass the moment it exceeds
+    // kIsoSurfaceMaxVertices; the surface is then rebuilt one stride
+    // coarser (roughly stride^2 fewer triangles each time) until it fits.
+    // The caller's stride is therefore a floor, not a guarantee.
+    constexpr size_t kIsoSurfaceMaxVertices = 24'000'000;  // 8M triangles, ~0.7GiB of vertex data
+    constexpr int kIsoSurfaceMaxStride = 64;
+    for (;; ++stride) {
+        unsigned int numThreads = ParallelForZThreadCount(grid.nz - 1);
+        std::vector<OverlayMesh> partials(numThreads);
+        std::atomic<size_t> totalVertices{0};
+        std::atomic<bool> overBudget{false};
 
-    ParallelForZ(grid.nz - 1, [&](int zBegin, int zEnd, unsigned int threadIndex) {
-        OverlayMesh& local = partials[threadIndex];
-        int zStartAligned = (zBegin / stride) * stride;
-        for (int z = zStartAligned; z < zEnd; z += stride) {
-            if (z < zBegin) continue;
-            int zNext = std::min(z + stride, grid.nz - 1);
-            if (zNext == z) continue;
+        ParallelForZ(grid.nz - 1, [&](int zBegin, int zEnd, unsigned int threadIndex) {
+            OverlayMesh& local = partials[threadIndex];
+            int zStartAligned = (zBegin / stride) * stride;
+            size_t reportedVertices = 0;
+            for (int z = zStartAligned; z < zEnd; z += stride) {
+                if (z < zBegin) continue;
+                if (overBudget.load(std::memory_order_relaxed)) return;  // another thread already blew the budget
+                int zNext = std::min(z + stride, grid.nz - 1);
+                if (zNext == z) continue;
 
-            for (int y = 0; y + 1 < grid.ny; y += stride) {
-                int yNext = std::min(y + stride, grid.ny - 1);
-                for (int x = 0; x + 1 < grid.nx; x += stride) {
-                    int xNext = std::min(x + stride, grid.nx - 1);
+                for (int y = 0; y + 1 < grid.ny; y += stride) {
+                    int yNext = std::min(y + stride, grid.ny - 1);
+                    for (int x = 0; x + 1 < grid.nx; x += stride) {
+                        int xNext = std::min(x + stride, grid.nx - 1);
 
-                    int cx[8] = {x, xNext, xNext, x, x, xNext, xNext, x};
-                    int cy[8] = {y, y, yNext, yNext, y, y, yNext, yNext};
-                    int cz[8] = {z, z, z, z, zNext, zNext, zNext, zNext};
+                        int cx[8] = {x, xNext, xNext, x, x, xNext, xNext, x};
+                        int cy[8] = {y, y, yNext, yNext, y, y, yNext, yNext};
+                        int cz[8] = {z, z, z, z, zNext, zNext, zNext, zNext};
 
-                    float val[8];
-                    int cubeIndex = 0;
-                    for (int k = 0; k < 8; ++k) {
-                        val[k] = sampleVal(cx[k], cy[k], cz[k]);
-                        bool inside = encloseGreater ? (val[k] >= isoValue) : (val[k] <= isoValue);
-                        if (inside) cubeIndex |= (1 << k);
-                    }
+                        float val[8];
+                        int cubeIndex = 0;
+                        for (int k = 0; k < 8; ++k) {
+                            val[k] = sampleVal(cx[k], cy[k], cz[k]);
+                            bool inside = encloseGreater ? (val[k] >= isoValue) : (val[k] <= isoValue);
+                            if (inside) cubeIndex |= (1 << k);
+                        }
 
-                    int edgeMask = MarchingCubes::kEdgeTable[cubeIndex];
-                    if (edgeMask == 0) continue;
+                        int edgeMask = MarchingCubes::kEdgeTable[cubeIndex];
+                        if (edgeMask == 0) continue;
 
-                    OverlayVertex edgeVerts[12];
-                    for (int e = 0; e < 12; ++e) {
-                        if (!(edgeMask & (1 << e))) continue;
-                        int c0 = MarchingCubes::kEdgeCorners[e][0];
-                        int c1 = MarchingCubes::kEdgeCorners[e][1];
-                        float v0 = val[c0];
-                        float v1 = val[c1];
-                        float denom = v1 - v0;
-                        float t = (std::fabs(denom) > 1e-12f) ? std::clamp((isoValue - v0) / denom, 0.0f, 1.0f) : 0.5f;
+                        OverlayVertex edgeVerts[12];
+                        for (int e = 0; e < 12; ++e) {
+                            if (!(edgeMask & (1 << e))) continue;
+                            int c0 = MarchingCubes::kEdgeCorners[e][0];
+                            int c1 = MarchingCubes::kEdgeCorners[e][1];
+                            float v0 = val[c0];
+                            float v1 = val[c1];
+                            float denom = v1 - v0;
+                            float t = (std::fabs(denom) > 1e-12f) ? std::clamp((isoValue - v0) / denom, 0.0f, 1.0f) : 0.5f;
 
-                        Vec3 p0 = grid.CellCenter(cx[c0], cy[c0], cz[c0]);
-                        Vec3 p1 = grid.CellCenter(cx[c1], cy[c1], cz[c1]);
-                        Vec3 pos = p0 + (p1 - p0) * t;
+                            Vec3 p0 = grid.CellCenter(cx[c0], cy[c0], cz[c0]);
+                            Vec3 p1 = grid.CellCenter(cx[c1], cy[c1], cz[c1]);
+                            Vec3 pos = p0 + (p1 - p0) * t;
 
-                        Vec3 g0 = gradWorld(cx[c0], cy[c0], cz[c0]);
-                        Vec3 g1 = gradWorld(cx[c1], cy[c1], cz[c1]);
-                        Vec3 grad = g0 + (g1 - g0) * t;
-                        float glen = Length(grad);
-                        Vec3 normal = (glen > 1e-5f) ? (grad * (1.0f / glen)) : Vec3{0.0f, 0.0f, 1.0f};
-                        if (!encloseGreater) normal = normal * -1.0f;
+                            Vec3 g0 = gradWorld(cx[c0], cy[c0], cz[c0]);
+                            Vec3 g1 = gradWorld(cx[c1], cy[c1], cz[c1]);
+                            Vec3 grad = g0 + (g1 - g0) * t;
+                            float glen = Length(grad);
+                            Vec3 normal = (glen > 1e-5f) ? (grad * (1.0f / glen)) : Vec3{0.0f, 0.0f, 1.0f};
+                            if (!encloseGreater) normal = normal * -1.0f;
 
-                        float ndotl = std::fabs(Dot(normal, kLightDir));
-                        float hemi = 0.5f + 0.5f * std::fabs(normal.z);
-                        float shade = 0.62f + 0.28f * ndotl + 0.10f * hemi;
-                        edgeVerts[e] = {pos, baseColor * shade, alpha};
-                    }
+                            float ndotl = std::fabs(Dot(normal, kLightDir));
+                            float hemi = 0.5f + 0.5f * std::fabs(normal.z);
+                            float shade = 0.62f + 0.28f * ndotl + 0.10f * hemi;
+                            edgeVerts[e] = {pos, baseColor * shade, alpha};
+                        }
 
-                    for (int i = 0; MarchingCubes::kTriTable[cubeIndex][i] != -1; i += 3) {
-                        int e0 = MarchingCubes::kTriTable[cubeIndex][i + 0];
-                        int e1 = MarchingCubes::kTriTable[cubeIndex][i + 1];
-                        int e2 = MarchingCubes::kTriTable[cubeIndex][i + 2];
-                        uint32_t base = static_cast<uint32_t>(local.vertices.size());
-                        local.vertices.push_back(edgeVerts[e0]);
-                        local.vertices.push_back(edgeVerts[e1]);
-                        local.vertices.push_back(edgeVerts[e2]);
-                        local.indices.push_back(base + 0);
-                        local.indices.push_back(base + 1);
-                        local.indices.push_back(base + 2);
+                        for (int i = 0; MarchingCubes::kTriTable[cubeIndex][i] != -1; i += 3) {
+                            int e0 = MarchingCubes::kTriTable[cubeIndex][i + 0];
+                            int e1 = MarchingCubes::kTriTable[cubeIndex][i + 1];
+                            int e2 = MarchingCubes::kTriTable[cubeIndex][i + 2];
+                            uint32_t base = static_cast<uint32_t>(local.vertices.size());
+                            local.vertices.push_back(edgeVerts[e0]);
+                            local.vertices.push_back(edgeVerts[e1]);
+                            local.vertices.push_back(edgeVerts[e2]);
+                            local.indices.push_back(base + 0);
+                            local.indices.push_back(base + 1);
+                            local.indices.push_back(base + 2);
+                        }
                     }
                 }
+                // Once per Z-layer, not per triangle: cheap, and a thread can
+                // only overshoot by one layer's worth before it notices.
+                size_t added = local.vertices.size() - reportedVertices;
+                reportedVertices = local.vertices.size();
+                if (totalVertices.fetch_add(added, std::memory_order_relaxed) + added > kIsoSurfaceMaxVertices) {
+                    overBudget.store(true, std::memory_order_relaxed);
+                    return;
+                }
             }
-        }
-    });
+        });
 
-    for (const OverlayMesh& local : partials) {
-        AppendMesh(mesh, local);
+        if (!overBudget.load(std::memory_order_relaxed)) {
+            for (const OverlayMesh& local : partials) {
+                AppendMesh(mesh, local);
+            }
+            return mesh;
+        }
+        if (stride >= kIsoSurfaceMaxStride) return mesh;  // empty — nothing sensible left to try
     }
-    return mesh;
 }
 
 OverlayMesh FieldOverlay::BuildRaymarchMesh(const VoxelGrid& grid, const std::vector<float>& field,

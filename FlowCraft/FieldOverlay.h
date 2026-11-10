@@ -207,6 +207,9 @@ OverlayMesh BuildStressMapMesh(const VoxelGrid& grid, const std::vector<float>& 
 // `isoValue`. `encloseGreater` determines whether the surface encloses values
 // >= isoValue (e.g. high-speed jets, stagnation zones) or values <= isoValue
 // (e.g. low-speed aerodynamic wake bubbles, suction vortex cores).
+// `stride` is the coarsest-allowed sampling step's lower bound: if the
+// surface at that stride would exceed a fixed vertex budget, it is rebuilt
+// at successively coarser strides until it fits (see the .cpp).
 OverlayMesh BuildIsoSurfaceMesh(const VoxelGrid& grid, const std::vector<float>& field, FieldColorMode mode,
                                 float isoValue, float lo, float hi, float alpha = 0.90f,
                                 bool encloseGreater = false, int stride = 1,
