@@ -15,7 +15,7 @@ Due to the large RAM and compute resources required for CFD, I'm not sure how us
 <b>Can I use it to test my now Airbus A380 killer?</b> I don't know, I'm not an aerodynamicist, but given how much Compute and RAM resources are required to process a small 1000mm model (the flow doesn't really stabilise until around 1000 steps), I'd guess, probably not.<br>
 <b>Why didn't you include x, y, and z features and make this actually useful?</b> I don't know, I'm not an aerodynamicist. I just wanted to see some pretty 3D animations of fluid flows around my CAD models using my desktop computer.<br><br>
 
-For more serious aero-modelling work, I would suggest using the [XFLR5 application](https://www.flow5.tech/xflr5/xflr5.html), but sadly it looks like that project ended in June  2026.
+For more serious aero-modelling work, I would suggest using the [XFLR5 application](https://www.flow5.tech/xflr5/xflr5.html), but sadly it looks like that project ended in June  2026. I might try and add more detail to my slice visualiser to assist with Airfoil design, if I can find the time.
 
 Several visualisations are available; "smoke" trails, colour map (pressure/speed), Iso-Surface, and voxel space.
 <img src="ScreenShot1.jpg" alt="Colour map" width="500" />
