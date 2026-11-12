@@ -62,6 +62,40 @@ jobs:
           Copy-Item HighWingModel.stl FlowCraft-Windows/HighWingModel.stl
           Copy-Item README.md FlowCraft-Windows/README.md
           Copy-Item LICENSE FlowCraft-Windows/LICENSE
+
+          # Bundle vulkan-1.dll from pre-installed Vulkan SDK runner environment if present
+          if ($env:VULKAN_SDK -and (Test-Path "$env:VULKAN_SDK\Bin\vulkan-1.dll")) {
+              Copy-Item "$env:VULKAN_SDK\Bin\vulkan-1.dll" FlowCraft-Windows/vulkan-1.dll
+              Write-Host "Bundled vulkan-1.dll from $env:VULKAN_SDK"
+          }
+
+          # Download and unpack Mesa Lavapipe software Vulkan rasterizer for virtual machine fallback (e.g. VMware)
+          New-Item -ItemType Directory -Force -Path FlowCraft-Windows/lavapipe | Out-Null
+          try {
+              $lavapipeUrl = "https://github.com/mmozeiko/build-mesa/releases/download/26.3.0/mesa-lavapipe-x64-26.3.0.7z"
+              Write-Host "Downloading Mesa Lavapipe from $lavapipeUrl..."
+              Invoke-WebRequest -Uri $lavapipeUrl -OutFile mesa-lavapipe.7z
+              7z x mesa-lavapipe.7z -oFlowCraft-Windows/lavapipe -y
+              Remove-Item mesa-lavapipe.7z -Force
+              Write-Host "Mesa Lavapipe bundled successfully into lavapipe/"
+          } catch {
+              Write-Warning "Could not bundle Mesa Lavapipe: $_"
+          }
+
+          # Add batch script for explicit software fallback launch
+          $batContent = @"
+@echo off
+setlocal
+cd /d "%~dp0"
+if exist "%~dp0lavapipe\lvp_icd.x86_64.json" (
+    set "VK_DRIVER_FILES=%~dp0lavapipe\lvp_icd.x86_64.json"
+    set "VK_ICD_FILENAMES=%~dp0lavapipe\lvp_icd.x86_64.json"
+    set "PATH=%~dp0lavapipe;%PATH%"
+)
+start "" "%~dp0FlowCraft.exe" %*
+"@
+          [System.IO.File]::WriteAllText("FlowCraft-Windows/Run-FlowCraft-SoftwareRenderer.bat", $batContent)
+
           Compress-Archive -Path FlowCraft-Windows -DestinationPath FlowCraft-Windows.zip -Force
 
       - name: Package release archive (macOS .app bundle)

@@ -24,6 +24,16 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlgpu3.h"
@@ -7368,7 +7378,9 @@ int main(int, char**) {
     SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     SDL_Window* window = SDL_CreateWindow("FlowCraft", initialWidth, initialHeight, windowFlags);
     if (!window) {
-        SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
+        std::string err = SDL_GetError();
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow failed: %s", err.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "FlowCraft - Window Creation Error", err.c_str(), nullptr);
         return 1;
     }
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
@@ -7382,13 +7394,114 @@ int main(int, char**) {
         SDL_DestroySurface(iconSurface);
     }
 
-    SDL_GPUDevice* gpuDevice = SDL_CreateGPUDevice(kEmbeddedShaderFormats | SDL_GPU_SHADERFORMAT_METALLIB, true, nullptr);
+    auto ShowFatalError = [window](const char* title, const std::string& message) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "%s: %s", title, message.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message.c_str(), window);
+    };
+
+    SDL_GPUDevice* gpuDevice = nullptr;
+
+    // 1. First attempt: standard device creation with debug_mode = false.
+    // Setting debug_mode to false is essential for standard end-user setups: when true,
+    // SDL requires developer validation layers (VK_LAYER_KHRONOS_validation or
+    // D3D12 debug layer), which are only present when developer SDKs are installed.
+    gpuDevice = SDL_CreateGPUDevice(kEmbeddedShaderFormats | SDL_GPU_SHADERFORMAT_METALLIB, false, nullptr);
+
+    // 2. Second attempt: relaxed Vulkan device creation properties.
+    // Certain virtual machines or older GPUs do not support optional Vulkan features
+    // (such as shader clip distances, depth clamping, anisotropy, or strict hardware
+    // acceleration flags). Since FlowCraft does not rely on those optional features,
+    // relaxing these requirements allows SDL to bind to software renderers and older GPUs.
     if (!gpuDevice) {
-        SDL_Log("SDL_CreateGPUDevice failed: %s", SDL_GetError());
+        SDL_PropertiesID props = SDL_CreateProperties();
+        if (props != 0) {
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, false);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN, false);
+
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+#ifdef __APPLE__
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_METALLIB_BOOLEAN, true);
+#endif
+            gpuDevice = SDL_CreateGPUDeviceWithProperties(props);
+            SDL_DestroyProperties(props);
+        }
+    }
+
+#ifdef _WIN32
+    // 3. Third attempt (Windows / VMware fallback):
+    // VMware SVGA 3D graphics drivers do not supply Vulkan hardware acceleration to Windows guest VMs.
+    // If Mesa Lavapipe software Vulkan files (lvp_icd.x86_64.json / vulkan_lvp.dll) are present,
+    // automatically configure the Vulkan loader via VK_DRIVER_FILES to enable software rendering.
+    if (!gpuDevice) {
+        const char* basePath = SDL_GetBasePath();
+        if (basePath) {
+            std::string bp(basePath);
+            std::string icdCandidates[] = {
+                bp + "lavapipe\\lvp_icd.x86_64.json",
+                bp + "lavapipe\\lvp_icd.x64.json",
+                bp + "lavapipe\\lvp_icd.json",
+                bp + "lvp_icd.x86_64.json",
+                bp + "lvp_icd.x64.json",
+                bp + "lvp_icd.json",
+                bp + "vk_swiftshader_icd.json"
+            };
+            for (const auto& icdPath : icdCandidates) {
+                FILE* f = fopen(icdPath.c_str(), "r");
+                if (f) {
+                    fclose(f);
+                    SetEnvironmentVariableA("VK_DRIVER_FILES", icdPath.c_str());
+                    SetEnvironmentVariableA("VK_ICD_FILENAMES", icdPath.c_str());
+                    _putenv_s("VK_DRIVER_FILES", icdPath.c_str());
+                    _putenv_s("VK_ICD_FILENAMES", icdPath.c_str());
+                    std::string dir = icdPath.substr(0, icdPath.find_last_of("\\/"));
+                    if (!dir.empty()) {
+                        const char* curPath = getenv("PATH");
+                        std::string newPath = dir + ";" + (curPath ? curPath : "");
+                        SetEnvironmentVariableA("PATH", newPath.c_str());
+                        _putenv_s("PATH", newPath.c_str());
+                    }
+                    gpuDevice = SDL_CreateGPUDevice(kEmbeddedShaderFormats, false, nullptr);
+                    if (gpuDevice) {
+                        SDL_Log("FlowCraft: successfully initialized software Vulkan driver: %s", icdPath.c_str());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    if (!gpuDevice) {
+        const char* sdlErr = SDL_GetError();
+        std::string errStr = (sdlErr && sdlErr[0]) ? sdlErr : "No compatible graphics adapter found.";
+        std::string message =
+            "FlowCraft was unable to initialize a compatible graphics device (GPU).\n\n"
+            "SDL error: " + errStr + "\n\n"
+            "Requirements:\n"
+            "  - Windows / Linux: Vulkan 1.0+ compatible GPU\n"
+            "  - macOS: Metal compatible GPU (Apple Silicon or Intel Mac2)\n\n"
+            "Running inside a Virtual Machine (e.g. VMware Workstation / Fusion / VirtualBox)?\n"
+            "  - Virtual machine 3D adapters (such as VMware SVGA 3D) do not supply a\n"
+            "    Vulkan driver to Windows guest VMs by default.\n"
+            "  - To run inside VMware on Windows:\n"
+            "      FlowCraft includes Mesa Lavapipe software rendering files in the 'lavapipe' subfolder.\n"
+            "      Launch using 'Run-FlowCraft-SoftwareRenderer.bat' or run FlowCraft directly on your host operating system.";
+
+        ShowFatalError("FlowCraft - GPU Initialization Error", message);
         return 1;
     }
+
     if (!SDL_ClaimWindowForGPUDevice(gpuDevice, window)) {
-        SDL_Log("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
+        const char* sdlErr = SDL_GetError();
+        std::string errStr = (sdlErr && sdlErr[0]) ? sdlErr : "Failed to claim window.";
+        std::string message = "FlowCraft failed to claim the application window for the GPU device:\n\n" + errStr;
+        ShowFatalError("FlowCraft - Window Claim Error", message);
         return 1;
     }
     SDL_SetGPUSwapchainParameters(gpuDevice, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
@@ -7402,15 +7515,18 @@ int main(int, char**) {
     app.slicePlanes[static_cast<size_t>(SliceAxis::Y)].enabledAtomic.store(true, std::memory_order_relaxed);
     app.gpuDevice = gpuDevice;
     if (!app.renderer.Init(gpuDevice, window)) {
-        SDL_Log("MeshRenderer::Init failed");
+        std::string message = std::string("FlowCraft failed to initialize the 3D mesh renderer:\n\n") + SDL_GetError();
+        ShowFatalError("FlowCraft - Renderer Initialization Error", message);
         return 1;
     }
     if (!app.voxelRenderer.Init(gpuDevice, window)) {
-        SDL_Log("MeshRenderer::Init (voxel) failed");
+        std::string message = std::string("FlowCraft failed to initialize the voxel renderer:\n\n") + SDL_GetError();
+        ShowFatalError("FlowCraft - Renderer Initialization Error", message);
         return 1;
     }
     if (!app.overlayRenderer.Init(gpuDevice, window)) {
-        SDL_Log("OverlayRenderer::Init failed");
+        std::string message = std::string("FlowCraft failed to initialize the overlay renderer:\n\n") + SDL_GetError();
+        ShowFatalError("FlowCraft - Renderer Initialization Error", message);
         return 1;
     }
 

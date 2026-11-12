@@ -30,6 +30,14 @@ As a nice bonus, the visualiser can also show pressure stress on the airframe, w
 
 Why the name FlowCraft, all apps seem to be called something Craft now :-)
 
+## System Requirements & Platform Support
+
+- **macOS**: Requires macOS 11+ with Apple Silicon or Metal-capable Intel GPU.
+- **Windows**: Requires Windows 10/11 64-bit with a Vulkan 1.0+ capable graphics driver (NVIDIA, AMD, or Intel).
+  - **Running in Virtual Machines (VMware Workstation / Fusion / VirtualBox)**:
+    Virtual machine 3D display drivers (such as VMware SVGA 3D) do not provide a Vulkan driver to Windows guest VMs. FlowCraft includes automated fallback to Mesa Lavapipe software Vulkan rendering. If hardware Vulkan is unavailable in your VM, FlowCraft will automatically load Lavapipe, or you can explicitly double-click `Run-FlowCraft-SoftwareRenderer.bat`.
+- **Linux**: Requires a Vulkan 1.0+ capable GPU or Mesa software rasterizer (`lavapipe`).
+
 ## License
 
 FlowCraft is licensed under the [GNU Lesser General Public License v3.0 (LGPL-3.0)](LICENSE).
