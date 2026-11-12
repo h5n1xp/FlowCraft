@@ -83,18 +83,18 @@ jobs:
           }
 
           # Add batch script for explicit software fallback launch
-          $batContent = @"
-@echo off
-setlocal
-cd /d "%~dp0"
-if exist "%~dp0lavapipe\lvp_icd.x86_64.json" (
-    set "VK_DRIVER_FILES=%~dp0lavapipe\lvp_icd.x86_64.json"
-    set "VK_ICD_FILENAMES=%~dp0lavapipe\lvp_icd.x86_64.json"
-    set "PATH=%~dp0lavapipe;%PATH%"
-)
-start "" "%~dp0FlowCraft.exe" %*
-"@
-          [System.IO.File]::WriteAllText("FlowCraft-Windows/Run-FlowCraft-SoftwareRenderer.bat", $batContent)
+          $batLines = @(
+              "@echo off",
+              "setlocal",
+              "cd /d ""%~dp0""",
+              "if exist ""%~dp0lavapipe\lvp_icd.x86_64.json"" (",
+              "    set ""VK_DRIVER_FILES=%~dp0lavapipe\lvp_icd.x86_64.json""",
+              "    set ""VK_ICD_FILENAMES=%~dp0lavapipe\lvp_icd.x86_64.json""",
+              "    set ""PATH=%~dp0lavapipe;%PATH%""",
+              ")",
+              "start """" ""%~dp0FlowCraft.exe"" %*"
+          )
+          Set-Content -Path "FlowCraft-Windows/Run-FlowCraft-SoftwareRenderer.bat" -Value $batLines -Encoding Ascii
 
           Compress-Archive -Path FlowCraft-Windows -DestinationPath FlowCraft-Windows.zip -Force
 
