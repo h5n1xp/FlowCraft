@@ -5,7 +5,7 @@ Around a year ago I purchased a fantastic book called "Shaping the Vulcan" by St
 <img src="ShapingTheVulcan.jpg" alt="Book cover" width="100" /><br>
 
 This sparked a fascination as to how aircraft wings and fluids interact to generate lift. 
-Despite (or perhaps because of) my lack of experience in this subject and because I don't have space to build a real wind tunnel, I decided to create an application that can visualise these fluid flows in a more interesting way than a bunch of graphs on a spreadsheet. 
+Despite (or perhaps because of) my lack of experience in this subject and because I don't have space to build a real wind tunnel, I decided to create an application that can visualise these fluid flows in a more interesting way than as a bunch of graphs on a spreadsheet. 
 
 FlowCraft allows you to load any 3D object (in STL format), and then using the Lattice Boltzmann Method (D3Q19 and D3Q15) be able to visualise in realtime (as your machine allows) the fluid flow around that object.<br> The computation can be run on your GPU or CPU, but you will need a very powerful machine either way. The GPU backend tends to run faster, but is mostly limited by the memory available to the GPU. If your machine is lacking resources, I've included a Panel Method backend (and also a Potential Flow solver, if you really really really don't have much computing power), which is less computationally expensive, but isn't as accurate...
 My relatively old MacStudio Ultra can run the LBM GPU visualisation for ~220 million cell lattice at around 1 frame per second.
