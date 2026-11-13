@@ -63,10 +63,27 @@ jobs:
           Copy-Item README.md FlowCraft-Windows/README.md
           Copy-Item LICENSE FlowCraft-Windows/LICENSE
 
-          # Bundle vulkan-1.dll from pre-installed Vulkan SDK runner environment if present
+          # Ensure official 64-bit vulkan-1.dll loader is bundled for clean Windows/VM setups
+          $vulkanDllBundled = $false
           if ($env:VULKAN_SDK -and (Test-Path "$env:VULKAN_SDK\Bin\vulkan-1.dll")) {
               Copy-Item "$env:VULKAN_SDK\Bin\vulkan-1.dll" FlowCraft-Windows/vulkan-1.dll
+              $vulkanDllBundled = $true
               Write-Host "Bundled vulkan-1.dll from $env:VULKAN_SDK"
+          }
+          if (-not $vulkanDllBundled) {
+              try {
+                  $rtUrl = "https://sdk.lunarg.com/sdk/download/1.4.304.0/windows/vulkan-runtime-components.zip"
+                  Write-Host "Downloading Vulkan Runtime loader from $rtUrl..."
+                  Invoke-WebRequest -Uri $rtUrl -OutFile vulkan-rt.zip
+                  7z e vulkan-rt.zip "*/x64/vulkan-1.dll" -oFlowCraft-Windows -y
+                  Remove-Item vulkan-rt.zip -Force
+                  if (Test-Path "FlowCraft-Windows/vulkan-1.dll") {
+                      $vulkanDllBundled = $true
+                      Write-Host "Successfully bundled official vulkan-1.dll (x64) from LunarG"
+                  }
+              } catch {
+                  Write-Warning "Could not download Vulkan Runtime components: $_"
+              }
           }
 
           # Download and unpack Mesa Lavapipe software Vulkan rasterizer for virtual machine fallback (e.g. VMware)
@@ -90,7 +107,7 @@ jobs:
               "if exist ""%~dp0lavapipe\lvp_icd.x86_64.json"" (",
               "    set ""VK_DRIVER_FILES=%~dp0lavapipe\lvp_icd.x86_64.json""",
               "    set ""VK_ICD_FILENAMES=%~dp0lavapipe\lvp_icd.x86_64.json""",
-              "    set ""PATH=%~dp0lavapipe;%PATH%""",
+              "    set ""PATH=%~dp0;%~dp0lavapipe;%PATH%""",
               ")",
               "start """" ""%~dp0FlowCraft.exe"" %*"
           )
